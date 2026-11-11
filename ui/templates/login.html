@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>Sign in · Xodus suite</title>
+    <script>try{var t=localStorage.getItem("xodus.theme");if(t==="dark"||t==="light")document.documentElement.setAttribute("data-theme",t)}catch(e){}</script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/suite.css">
+    <link rel="stylesheet" href="/static/dm.css">
+    <link rel="stylesheet" href="/static/xodus.css">
+</head>
+<body>
+<div class="login">
+  <aside class="l-aside">
+    <div class="lock" style="color:#fff"><span class="mk">XA</span><span><strong>XODUS</strong><span>WealthAI Labs</span></span></div>
+    <div>
+      <span class="l-tag"><i></i> WealthAI Labs · for RIA acquirers</span>
+      <h1>Move the advisory book <b>without losing the detail</b>.</h1>
+      <p>A governed migration workbench with an agent at every stage and a human review gate before anything is approved. Reviews and approvals stay with people.</p>
+      <div class="l-flow">
+        <div class="l-row"><b>◉</b><span><strong>Load and inspect</strong><span>Source files profiled and classified</span></span><span class="pbchip">01</span></div>
+        <div class="l-row"><b>⇄</b><span><strong>Map to the canonical model</strong><span>Account, Client and Household</span></span><span class="pbchip">02</span></div>
+        <div class="l-row"><b>✓</b><span><strong>Validate and record</strong><span>Lineage, reconciliation and audit</span></span><span class="pbchip">03</span></div>
+      </div>
+    </div>
+    <div class="l-foot"><span>Protected platform</span><span>Session-based control plane auth</span></div>
+  </aside>
+  <main class="l-main">
+    <div class="l-card">
+      <div class="ey">Sign in</div>
+      <h2>Sign in to the Xodus suite</h2>
+      <p class="lead">Sign in once. After you choose your persona you reach the suite home, and Data Migration opens from there on the same session, with no second password.</p>
+
+      {% if demo_mode %}
+      <div class="idn">
+        <b>Local demo access enabled</b>
+        <span>Demo email: <span class="mono">{{ demo_email }}</span></span>
+        <span>Use the demo password configured for this repository's local demo account.</span>
+        <span style="font-size:11px">Demo only — disable demo authentication before any shared or production deployment.</span>
+      </div>
+      {% endif %}
+
+      <form action="/login" method="POST" style="display:grid;gap:12px">
+        {% if notice %}<div class="idn" data-testid="login-notice" role="status">{{ notice }}</div>{% endif %}
+        {% if error %}<div class="exc" style="background:var(--bad-bg);color:var(--bad);border-left-color:var(--bad)" role="alert">{{ error }}</div>{% endif %}
+
+        <label for="login-email" style="font-size:11px;font-weight:800;letter-spacing:.6px;text-transform:uppercase;color:var(--muted)">Email address</label>
+        <input type="email" id="login-email" name="email" autocomplete="username" required class="fld">
+
+        <label for="login-password" style="font-size:11px;font-weight:800;letter-spacing:.6px;text-transform:uppercase;color:var(--muted)">Password</label>
+        <input type="password" id="login-password" name="password" autocomplete="current-password" required class="fld">
+
+        <p class="hint" style="margin:4px 0 0;background:var(--tint-b);color:var(--ink-b)">Your persona controls the workspace view; access remains subject to assigned permissions.</p>
+
+        <button type="submit" class="btn p" style="justify-content:center;padding:12px">Sign in →</button>
+        <p style="text-align:center;font-size:12px;color:var(--muted);margin:0">New here? <a href="/register" style="font-weight:700;color:var(--ink-b)">Request an account</a></p>
+      </form>
+    </div>
+  </main>
+</div>
+</body>
+</html>

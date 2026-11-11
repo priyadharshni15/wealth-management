@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light" data-trole="{{ trole|default('IL') }}">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>{{ page_title|default('Migration Workspace') }} · XODUS {{ {"dm": "Data Migration", "gov": "Governance", "tenant": "Tenant settings"}[space|default("dm")] }}</title>
+    <script>try{var t=localStorage.getItem("xodus.theme");if(t==="dark"||t==="light")document.documentElement.setAttribute("data-theme",t)}catch(e){}</script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/suite.css">
+    <link rel="stylesheet" href="/static/dm.css">
+    <link rel="stylesheet" href="/static/xodus.css">
+    {# Fallback while pages are converted: Tailwind utilities and the previous xa-* styles keep unconverted markup working. #}
+    <link rel="stylesheet" href="/static/legacy.css">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="/static/assistant.css">
+</head>
+<body>
+<a class="xa-skip" href="#main-content">Skip to content</a>
+{% set pg = progress|default({}) %}
+{% set path = request.url.path %}
+{% set role = user_role|default('') %}
+{% set space = space|default("dm") %}{% set suite_cur = space %}{% set hide_signout = true %}{% include "_suite_top.html" %}
+{% if space == "dm" %}
+<div class="pbar">
+  <div class="wrap pb-in">
+    <span class="lock"><span class="mk">XA</span><span><strong>Data Migration</strong><span>Agentic migration workbench</span></span></span>
+    <div class="pb-ctx">
+      {% if lobby %}<span>Scope</span><b>All migration workspaces</b>{% else %}<span>Migration</span><b>{{ pg.facts.name if pg and pg.facts else 'New migration' }}</b>
+      {% if pg and pg.facts %}<span class="pbchip">{{ pg.facts.migration_id }}</span>{% endif %}{% endif %}
+    </div>
+    <span class="sp"></span>
+    {% if pg and pg.facts and not lobby %}<span class="pbchip">{{ pg.facts.route }}</span>{% endif %}
+    <div class="uc">
+      <span class="av" aria-hidden="true">{{ (user_name|default('MA')).split()[:2]|map('first')|join|upper }}</span>
+      <span>{{ user_name|default('Migration Analyst') }}<small>{{ role or 'Control plane' }}</small></span>
+    </div>
+    <a class="pbtn" href="/logout">Sign out</a>
+  </div>
+</div>
+{% endif %}
+<div class="wrap app{% if space != "dm" %} solo{% endif %}">
+  {% if space == "dm" %}<aside class="side" aria-label="Data migration navigation">
+    <div class="sh">Data migration</div>
+    {% if lobby %}
+    <a href="/migrations" class="nv on" aria-current="page">Migration workspaces</a>
+    {% else %}
+    <a href="/migrations" class="nv">← Migration workspaces</a>
+    <a href="/" class="nv {% if path == '/' %}on{% endif %}" {% if path == '/' %}aria-current="page"{% endif %}>Overview</a>
+    <a href="/setup" class="nv {% if path in ('/setup', '/migration-setup', '/target-mapping', '/firm-knowledge') %}on{% endif %}" {% if path in ('/setup', '/migration-setup', '/target-mapping', '/firm-knowledge') %}aria-current="page"{% endif %}>Setup</a>
+    {% if pg and pg.steps %}
+    {% set done_n = pg.steps|selectattr('state','equalto','done')|list|length %}
+    <div class="sh">{{ pg.facts.name }}</div>
+    <div class="runh">
+      <small>Pipeline run</small>
+      <strong>{{ pg.facts.migration_id }}</strong>
+      <div class="meter"><i style="width:{{ (done_n * 100 / (pg.steps|length))|round|int }}%"></i></div>
+      <div class="sub"><span><b style="color:#fff">{{ done_n }}</b> of {{ pg.steps|length }} steps complete</span><span>{{ pg.status_chip.label }}</span></div>
+      <a class="nx" href="{{ pg.next.href }}" title="{{ pg.next.detail }}">Next: {{ pg.next.label }} →</a>
+    </div>
+    {% set st = {} %}
+    {% for s in pg.steps %}{% if st.update({s.key: s.state}) %}{% endif %}{% endfor %}
+    {% macro stage(ix, name, href, key, owner, active) %}
+      {% set s = st.get(key, 'todo') %}
+      <a class="stg {% if active %}on{% endif %}" href="{{ href }}" {% if active %}aria-current="page"{% endif %}>
+        <span class="ix">{{ ix }}</span>
+        <span><strong>{{ name }}</strong><small>{{ {'done':'Complete','current':'Needs attention','todo':'Not started'}[s] }}</small></span>
+        <span class="own" title="Owner persona">{{ owner }}</span>
+        <span class="dot {{ {'done':'approved','current':'review','todo':''}[s] }}" aria-hidden="true"></span>
+      </a>
+    {% endmacro %}
+    <div class="zg landing"><i></i>Landing</div>
+    {{ stage('01', 'Loader & Inspector', '/entity-sample-files', 'discover', 'MA', path in ('/entity-sample-files', '/entity-selection')) }}
+    <div class="zg staged"><i></i>Staged</div>
+    {{ stage('02', 'Discovery', '/entity-sample-files#discovered-source-inventory', 'discover', 'MA', false) }}
+    {{ stage('03', 'Business Rules', '/transformation-rules', 'map', 'MA', path == '/transformation-rules') }}
+    <div class="zg transformed"><i></i>Transformed</div>
+    {{ stage('04', 'Schema Mapper', '/agent-pipeline', 'map', 'MA', path == '/agent-pipeline') }}
+    <div class="zg dplane"><i></i>Data plane</div>
+    {{ stage('05', 'Execution', '/execution', 'validate', 'VS', path == '/execution') }}
+    <div class="zg rules"><i></i>Validation</div>
+    {{ stage('06', 'Validation rules', '/validation-rules', 'validate', 'VS', path == '/validation-rules') }}
+    {{ stage('07', 'Reconciliation', '/reconciliation', 'validate', 'VS', path == '/reconciliation') }}
+    {% endif %}
+    <div class="sh">Workspace views</div>
+    <a href="/migration-workspaces?view=command" class="nv">Command center</a>
+    <div class="sh">Pilot scope</div>
+    <div class="scope"><span>Account</span><span>Household</span><span>Client</span></div>
+    <div class="fh" style="color:#8FA9BC;padding:6px 10px">Other entities and reverse mapping are deferred. Agent assistance runs inside Source Discovery automatically. Target loading and wave assignment are not active in this pilot.</div>
+    {% endif %}
+  </aside>{% endif %}
+  <main class="main xa-legacy" id="main-content">
+    {% block content %}{% endblock %}
+  </main>
+</div>
+<script>
+/* In-place actions. A POST form is sent with fetch and only the page content (top bar, rail, main) is swapped, so a click
+   no longer reloads the page: scroll position, open <details> and keyboard focus area stay put. Redirects to other pages,
+   downloads and failed requests degrade to normal navigation or a message. A form can opt out with data-full-reload.
+   A floating toast shows the notice/error because the inline banner sits at the top, out of view. */
+(function () {
+  var busy = false;
+  try { if ("scrollRestoration" in history) history.scrollRestoration = "manual"; } catch (e) {}
+  function toast(text, bad) {
+    if (!text) return;
+    if (bad && document.getElementById("workflow-error-modal")) return;  /* the page already shows this error in its own dialog */
+    var old = document.querySelector("[data-xtoast]"); if (old) old.remove();
+    var d = document.createElement("div");
+    d.setAttribute("role", "status"); d.setAttribute("data-xtoast", "1");
+    d.textContent = text;
+    d.style.cssText = "position:fixed;right:16px;bottom:16px;max-width:420px;z-index:9999;padding:12px 14px;border-radius:10px;font-size:12px;line-height:1.4;box-shadow:0 6px 24px rgba(0,0,0,.18);cursor:pointer;" +
+      (bad ? "background:#FEF2F2;color:#7F1D1D;border:1px solid #FECACA;" : "background:#F0FDFA;color:#134E4A;border:1px solid #99F6E4;");
+    d.onclick = function () { d.remove(); };
+    document.body.appendChild(d);
+    setTimeout(function () { d.remove(); }, 8000);
+  }
+  function toastFromUrl() {
+    var q = new URLSearchParams(location.search), text = q.get("notice") || q.get("error");
+    toast(text, !q.get("notice"));
+  }
+  function size() {
+    var b = document.querySelector(".pbar"), r = document.documentElement.style;
+    if (b) r.setProperty("--ph", b.offsetHeight + "px");
+  }
+  /* Table-style approvals: tick rows, add a note or a change, then submit. Editing a row's
+     change/note ticks it automatically; the header box selects every row in that table. */
+  function refresh() {
+    var checks = Array.prototype.slice.call(document.querySelectorAll("[data-row-check]"));
+    var n = checks.filter(function (c) { return c.checked; }).length;
+    document.querySelectorAll("[data-selected-count]").forEach(function (el) { el.textContent = n; });
+    document.querySelectorAll("[data-needs-selection]").forEach(function (b) { b.disabled = n === 0; });
+    document.querySelectorAll("[data-bulk-table]").forEach(function (t) {
+      var rows = t.querySelectorAll("[data-row-check]"), all = t.querySelector("[data-select-all]");
+      if (!all || !rows.length) return;
+      var on = Array.prototype.filter.call(rows, function (c) { return c.checked; }).length;
+      all.checked = on === rows.length; all.indeterminate = on > 0 && on < rows.length;
+    });
+  }
+  document.addEventListener("change", function (ev) {
+    var t = ev.target;
+    if (t.matches && t.matches("[data-select-all]")) {
+      t.closest("table").querySelectorAll("[data-row-check]").forEach(function (c) { c.checked = t.checked; });
+    } else if (t.matches && t.matches("[data-row-input]")) {
+      var tr = t.closest("tr"), c = tr && tr.querySelector("[data-row-check]");
+      if (c && t.value) c.checked = true;
+    }
+    refresh();
+  });
+  document.addEventListener("input", function (ev) {
+    var t = ev.target;
+    if (t.matches && t.matches("[data-row-input]") && t.value) {
+      var tr = t.closest("tr"), c = tr && tr.querySelector("[data-row-check]");
+      if (c && !c.checked) { c.checked = true; refresh(); }
+    }
+  });
+  document.addEventListener("click", function (ev) {
+    var tb = ev.target.closest && ev.target.closest("#themeBtn");
+    if (tb) {
+      var next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+      document.documentElement.setAttribute("data-theme", next);
+      try { localStorage.setItem("xodus.theme", next); } catch (e) {}
+      return;
+    }
+    var use = ev.target.closest && ev.target.closest("[data-use-rule]");
+    if (use) {
+      var input = use.closest("td").querySelector("input[name^='rule::']");
+      if (input) { input.value = use.getAttribute("data-use-rule"); input.dispatchEvent(new Event("input", {bubbles: true})); }
+    }
+  });
+  function openKeys() {
+    var keys = {};
+    document.querySelectorAll("#main-content details[open]").forEach(function (d) {
+      var s = d.querySelector("summary"); keys[(d.id || "") + "|" + (s ? s.textContent.trim() : "")] = 1;
+    });
+    return keys;
+  }
+  function reopen(keys) {
+    document.querySelectorAll("#main-content details").forEach(function (d) {
+      var s = d.querySelector("summary");
+      if (keys[(d.id || "") + "|" + (s ? s.textContent.trim() : "")]) d.open = true;
+    });
+  }
+  function runScripts(root) {
+    root.querySelectorAll("script").forEach(function (old) {
+      var n = document.createElement("script");
+      Array.prototype.forEach.call(old.attributes, function (a) { n.setAttribute(a.name, a.value); });
+      n.textContent = old.textContent; old.replaceWith(n);
+    });
+  }
+  function swap(doc, url) {
+    var keys = openKeys(), y = window.scrollY;
+    ["header.xtop", ".pbar", ".wrap.app"].forEach(function (sel) {
+      var cur = document.querySelector(sel), nxt = doc.querySelector(sel);
+      if (cur && nxt) cur.replaceWith(document.importNode(nxt, true));
+    });
+    document.title = doc.title || document.title;
+    var u = new URL(url, location.href), q = new URLSearchParams(u.search), text = q.get("notice") || q.get("error"), bad = !q.get("notice");
+    q.delete("notice"); q.delete("error");
+    try { history.replaceState(null, "", u.pathname + (q.toString() ? "?" + q.toString() : "") + u.hash); } catch (e) {}
+    runScripts(document.querySelector(".wrap.app"));
+    reopen(keys); size(); refresh();
+    var target = u.hash && document.getElementById(decodeURIComponent(u.hash.slice(1)));
+    if (target) target.scrollIntoView({block: "start"}); else window.scrollTo(0, y);
+    toast(text, bad);
+  }
+  function download(resp) {
+    var cd = resp.headers.get("content-disposition") || "", m = /filename="?([^";]+)"?/i.exec(cd);
+    return resp.blob().then(function (blob) {
+      var a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = m ? m[1] : "download";
+      document.body.appendChild(a); a.click(); a.remove(); setTimeout(function () { URL.revokeObjectURL(a.href); }, 4000);
+    });
+  }
+  document.addEventListener("submit", function (ev) {
+    var f = ev.target, sub = ev.submitter;
+    if (ev.defaultPrevented || !f || (f.method || "get").toLowerCase() !== "post" || f.hasAttribute("data-full-reload") || busy) return;
+    if (f.target && f.target !== "_self") return;
+    var action = (sub && sub.getAttribute("formaction")) || f.getAttribute("action") || location.pathname + location.search;
+    var url = new URL(action, location.href);
+    if (url.origin !== location.origin || !document.getElementById("main-content") || !window.fetch || !window.DOMParser) return;
+    ev.preventDefault();
+    busy = true; document.body.style.cursor = "progress";
+    var multipart = /multipart/i.test(f.enctype || "");
+    var data = sub ? new FormData(f, sub) : new FormData(f);
+    var body = multipart ? data : new URLSearchParams(data);
+    var held = sub && !sub.disabled ? sub : null; if (held) held.disabled = true;
+    fetch(url.href, {method: "POST", body: body, credentials: "same-origin", redirect: "follow", headers: {"X-Requested-With": "xodus-fetch", "Accept": "text/html,application/json,*/*"}})
+      .then(function (resp) {
+        var type = (resp.headers.get("content-type") || "").toLowerCase();
+        if (/attachment/i.test(resp.headers.get("content-disposition") || "") || /zip|yaml|octet-stream/.test(type)) return download(resp);
+        if (type.indexOf("text/html") === -1) {
+          return resp.text().then(function (t) {
+            var msg = t; try { var j = JSON.parse(t); msg = j.detail || j.message || j.error || (resp.ok ? "Done." : "The request failed."); if (typeof msg !== "string") msg = JSON.stringify(msg); } catch (e) {}
+            toast(String(msg).slice(0, 300), !resp.ok);
+          });
+        }
+        return resp.text().then(function (html) {
+          var doc = new DOMParser().parseFromString(html, "text/html");
+          if (doc.getElementById("main-content")) return swap(doc, resp.redirected ? resp.url : location.href);  /* a direct 200 (e.g. a preview) must not leave an /api/ address in the bar */
+          if (resp.redirected) { location.assign(resp.url); return; }
+          document.open(); document.write(html); document.close();
+        });
+      })
+      .catch(function () { toast("Could not reach the server. Nothing was changed on this page; try again.", true); })
+      .then(function () { busy = false; document.body.style.cursor = ""; if (held) held.disabled = false; });
+  });
+  document.addEventListener("DOMContentLoaded", function () { toastFromUrl(); refresh(); size(); });
+  window.addEventListener("resize", size); window.addEventListener("load", size);
+})();
+</script>
+<script src="/static/assistant.js"></script>
+</body>
+</html>

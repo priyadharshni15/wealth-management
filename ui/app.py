@@ -1,0 +1,4337 @@
+import os
+import re
+import uuid
+import json
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import quote, quote_plus, urlparse
+from typing import Dict, Any, List, Optional
+from fastapi import FastAPI, Request, Form, File, UploadFile, HTTPException, status
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse, Response
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+
+from ui.auth import session_mgr
+from ui.work_queue import build_queue
+from ui.role_policy import DEFINITION_ROLES, TARGET_PREVIEW_ROLES, VALIDATION_ROLES, APPROVAL_ROLES, CANONICAL_ROLES, CHANGE_REQUEST_ROLES, DISCOVERY_ROLES, PLATFORM_ROLES, SETUP_ROLES, allowed_roles_for
+from ui.state import state_store
+from agents.discovery.schema_mapper_agent import SchemaMapperAgent
+from control_plane import file_store
+from control_plane.services import user_registry, adf_simulator, artifact_store, execution_simulator, package_contract, cross_file, adf_package, azure_simulated, activity_feed, canonical_overlay, migration_validation, validation_scenarios, rule_inference, rule_suggestions, drift_detection, signoff_evidence, target_connector, target_inference, target_mapping, transformation_rules, migration_registry
+from control_plane.services.value_evidence import EVIDENCE_REVIEW_THRESHOLD
+from data_plane.storage_manager import HybridStorageManager
+from control_plane.services.profiler import SourceDataProfiler
+from control_plane.services.mcl_validation import validate_mcl_relationships
+from control_plane.services.source_file_adapter import read_source_records
+from control_plane.services.wave_rules import CohortConditionEngine, WaveConditionEvaluator
+from control_plane.services.adf_client import AzureDataFactoryClient
+from control_plane.services.adf_exporter import ADFPackageExporter
+from control_plane.db import get_db_connection, using_postgres
+from control_plane.services.firm_config import FirmConfigError, load_firm_config
+from control_plane.services.workflow_event_engine import publish_event, read_events, get_projection, replay_events
+from agents.p0_agent_suite import MigrationAgentCoordinator
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("DataMigrationWorkbench")
+
+app = FastAPI(title="Data Migration Workbench", version="3.5.0")
+
+
+@app.middleware("http")
+async def enforce_role_policy(request: Request, call_next):
+    """Reject state-changing requests from roles that may not perform them (session role, server side)."""
+    allowed = allowed_roles_for(request.method, request.url.path)
+    if allowed is not None:
+        session = session_mgr.get_session(request)
+        # Unauthenticated callers fall through to the route's own login redirect.
+        if session is not None and session.get("role") not in allowed:
+            detail = f"{session.get('role')} may not perform this action. Allowed: {', '.join(sorted(allowed))}."
+            if "text/html" in request.headers.get("accept", ""):
+                path = urlparse(request.headers.get("referer", "/")).path or "/"
+                return RedirectResponse(url=f"{path}?error=" + quote_plus(detail), status_code=status.HTTP_303_SEE_OTHER)
+            return JSONResponse({"detail": detail}, status_code=status.HTTP_403_FORBIDDEN)
+    return await call_next(request)
+
+ui_dir = os.path.dirname(os.path.abspath(__file__))
+root_dir = os.path.abspath(os.path.join(ui_dir, ".."))
+
+static_dir = os.path.join(ui_dir, "static")
+templates_dir = os.path.join(ui_dir, "templates")
+
+os.makedirs(static_dir, exist_ok=True)
+os.makedirs(templates_dir, exist_ok=True)
+
+app.mount("/static", StaticFiles(directory=static_dir), name="static")
+templates = Jinja2Templates(directory=templates_dir)
+templates.env.filters["mapping_kind"] = lambda rule, field=None: SchemaMapperAgent.mapping_kind(rule, field)
+
+schema_mapper = SchemaMapperAgent()
+adf_client = AzureDataFactoryClient()
+
+
+def get_current_user(request: Request) -> Dict[str, str]:
+    session = session_mgr.get_session(request)
+    if not session:
+        raise HTTPException(status_code=status.HTTP_307_TEMPORARY_REDIRECT, headers={"Location": "/login"})
+    return session
+
+
+def _can_load_demo(user: Dict[str, str]) -> bool:
+    return user.get("role") in PLATFORM_ROLES and session_mgr.can_load_demo(user.get("email", ""))
+
+
+def _workflow_safe_source_payload(record: Dict[str, Any], entity_name: str, source_role: str) -> Dict[str, Any]:
+    """Persist source metadata and evidence without duplicating sampled client values in the event log."""
+    payload = {**record, "entity": entity_name, "source_role": source_role}
+
+    def remove_samples(value):
+        if isinstance(value, dict):
+            return {
+                key: remove_samples(item)
+                for key, item in value.items()
+                if key not in {"sample_value", "sample_values"}
+            }
+        if isinstance(value, list):
+            return [remove_samples(item) for item in value]
+        return value
+
+    return remove_samples(payload)
+
+
+def workflow_progress() -> dict:
+    """Counts and the single next action shown in the navigation and dashboard."""
+    setup = state_store.questionnaire_data.get("migration_setup", {})
+    scope = [e for e in setup.get("entities", []) if e in {"Account", "Household", "Client"}]
+    migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    files = [rec for entity, group in getattr(state_store, "entity_source_files", {}).items() for rec in group.values()]
+    files_total = len(files)
+    files_confirmed = sum(1 for r in files if r.get("inference_approval_status") == "APPROVED")
+    files_pending = sum(1 for r in files if r.get("inference_approval_status") not in {"APPROVED", "REJECTED"})
+    proposals_pending = mappings_approved = changes_open = rfi_open = target_pending = 0
+    target_provisioned = False
+    validation_status = validation_when = ""
+    conn = get_db_connection()
+    try:
+        proposals_pending = conn.execute(
+            "SELECT COUNT(*) FROM mapping_suggestions WHERE migration_id = ? AND status = 'PENDING'", (migration_id,)).fetchone()[0]
+        mappings_approved = conn.execute(
+            "SELECT COUNT(*) FROM canonical_mappings WHERE migration_id = ? AND is_confirmed = 1", (migration_id,)).fetchone()[0]
+        if scope:
+            marks = ",".join("?" for _ in scope)
+            rfi_open = conn.execute(
+                f"SELECT COUNT(*) FROM mapping_information_requests WHERE migration_id = ? AND status != 'RESOLVED' AND entity_name IN ({marks})",
+                (migration_id, *scope)).fetchone()[0]
+        changes_open = conn.execute(
+            "SELECT COUNT(*) FROM canonical_change_requests WHERE migration_id = ? AND status IN ('OPEN','DEFERRED')", (migration_id,)).fetchone()[0]
+        target_provisioned = target_connector.is_confirmed(target_connector.get_config(conn))
+        target_pending = len([m for m in target_mapping.list_mappings(conn, migration_id, target_connector.spec(conn))
+                              if m["status"] == "PROPOSED" and m["canonical_field"]])
+        last_val = conn.execute(
+            "SELECT run_id, status, results_json, executed_utc FROM validation_runs WHERE migration_id = ? ORDER BY executed_utc DESC LIMIT 1", (migration_id,)).fetchone()
+        if last_val:
+            validation_status, validation_when = last_val["status"], str(last_val["executed_utc"])[:10]
+            # Findings accepted through an approved exception no longer hold the workflow back (same rule as the Validation page).
+            try:
+                checks = json.loads(last_val["results_json"]).get("checks", [])
+                excs = validation_scenarios.list_exceptions(conn, migration_id, last_val["run_id"])
+                validation_status = validation_scenarios.effective_status(checks, excs)
+                accepted = sum(1 for e in excs if e["status"] == "APPROVED")
+                if accepted and validation_status == "PASS" and last_val["status"] != "PASS":
+                    validation_when += f" · {accepted} accepted exception(s)"
+            except (ValueError, TypeError, KeyError):
+                pass
+    except Exception:
+        logger.exception("Could not read workflow progress counts")
+    finally:
+        conn.close()
+    if not scope:
+        nxt = {"label": "Set up the migration", "detail": "Choose the entities in scope and register knowledge.", "href": "/migration-setup", "step": "setup"}
+    elif files_total == 0:
+        nxt = {"label": "Add source files", "detail": "Upload CoreCap files or load the demo data set.", "href": "/entity-sample-files", "step": "discover"}
+    elif files_pending:
+        nxt = {"label": f"Confirm {files_pending} source file{'s' if files_pending != 1 else ''}", "detail": "Review the inferred entity for each file.", "href": "/entity-sample-files", "step": "discover"}
+    elif proposals_pending:
+        nxt = {"label": f"Review {proposals_pending} mapping proposal{'s' if proposals_pending != 1 else ''}", "detail": "Approve or reject the suggested source-to-canonical mappings.", "href": "/agent-pipeline", "step": "map"}
+    elif mappings_approved == 0:
+        nxt = {"label": "Generate mapping proposals", "detail": "Profile the confirmed files and create review items.", "href": "/agent-pipeline", "step": "map"}
+    elif rfi_open:
+        nxt = {"label": f"Answer {rfi_open} information request{'s' if rfi_open != 1 else ''}", "detail": "Required canonical fields still have no source.", "href": "/agent-pipeline#information-requests", "step": "map"}
+    elif not target_provisioned:
+        nxt = {"label": "Confirm the target system", "detail": "One-time platform setup: configure, infer and confirm the target before target mapping.", "href": "/target-mapping#target-system", "step": "map"}
+    else:
+        nxt = {"label": "Review validation results", "detail": "All mappings are approved; check keys, relationships and exceptions.", "href": "/reconciliation", "step": "validate"}
+    progress = {
+        "scope": scope, "files_total": files_total, "files_confirmed": files_confirmed, "files_pending": files_pending,
+        "proposals_pending": proposals_pending, "mappings_approved": mappings_approved, "rfi_open": rfi_open,
+        "changes_open": changes_open, "next": nxt, "target_provisioned": target_provisioned, "target_pending": target_pending,
+        "validation_status": validation_status, "validation_when": validation_when,
+    }
+    progress.update(build_workflow_view(progress, setup, migration_id))
+    progress["activity"] = activity_feed.recent_activity(migration_id)
+    return progress
+
+
+def build_workflow_view(p: dict, setup: dict, migration_id: str) -> dict:
+    """Stepper, per-step sub-tasks, header facts and status chip derived from the progress counts."""
+    def task(label, state, detail=""):
+        return {"label": label, "state": state, "detail": detail}
+
+    configured = bool(p["scope"])
+    discover_done = p["files_total"] > 0 and p["files_pending"] == 0
+    map_done = p["mappings_approved"] > 0 and p["proposals_pending"] == 0 and p["rfi_open"] == 0 and p["target_provisioned"]
+    validate_done = p["validation_status"] == "PASS"
+    tasks = {
+        "setup": [
+            task("Migration configured", "complete" if configured else "needs_you",
+                 ", ".join(p["scope"]) if configured else "Choose the entities in scope."),
+            task("Firm contract registered", "complete" if setup.get("firm_config_version") else "not_started",
+                 str(setup.get("firm_config_version", ""))),
+        ],
+        "discover": [
+            task("Source files added", "complete" if p["files_total"] else "needs_you", f"{p['files_total']} file(s)"),
+            task("Entities confirmed", "complete" if discover_done else ("needs_you" if p["files_pending"] else "not_started"),
+                 f"{p['files_confirmed']} of {p['files_total']} confirmed"),
+        ],
+        "map": [
+            task("Mapping proposals reviewed", "complete" if (p["mappings_approved"] and not p["proposals_pending"]) else
+                 ("needs_you" if p["proposals_pending"] else "not_started"), f"{p['proposals_pending']} waiting"),
+            task("Mappings approved", "complete" if p["mappings_approved"] else "not_started", f"{p['mappings_approved']} approved"),
+            task("Information requests answered", "complete" if not p["rfi_open"] else "needs_you", f"{p['rfi_open']} open"),
+            task("Target system confirmed", "complete" if p["target_provisioned"] else "needs_you", "Platform-level, one time"),
+        ],
+        "validate": [
+            task("Validation checks run", "complete" if p["validation_status"] else "not_started",
+                 f"{p['validation_status']} · {p['validation_when']}" if p["validation_status"] else "Not run yet"),
+            task("Canonical change requests", "needs_you" if p["changes_open"] else "complete", f"{p['changes_open']} open or deferred"),
+        ],
+    }
+    current = p["next"]["step"]
+    done = {"setup": configured, "discover": discover_done, "map": map_done, "validate": validate_done}
+    captions = {
+        "setup": "Configured" if configured else "Not configured",
+        "discover": f"{p['files_confirmed']}/{p['files_total']} files",
+        "map": f"{p['mappings_approved']} approved",
+        "validate": p["validation_status"].title() if p["validation_status"] else "Not run",
+    }
+    hrefs = {"setup": "/migration-setup", "discover": "/entity-sample-files", "map": "/agent-pipeline", "validate": "/reconciliation"}
+    titles = {"setup": "Setup", "discover": "Discover", "map": "Map & review", "validate": "Validate"}
+    steps = []
+    for number, key in enumerate(("setup", "discover", "map", "validate"), start=1):
+        state = "current" if key == current else ("done" if done[key] else "todo")
+        steps.append({"key": key, "number": number, "title": titles[key], "href": hrefs[key], "state": state, "caption": captions[key]})
+    if not configured:
+        chip = ("Setup needed", "attention")
+    elif validate_done and discover_done and map_done:
+        chip = ("Validated", "done")
+    elif current == "validate":
+        chip = ("Ready to validate", "info")
+    else:
+        chip = (f"In progress · {titles[current]}", "info")
+    facts = {
+        "name": setup.get("migration_name") or state_store.questionnaire_data.get("migration_name") or "New migration",
+        "route": f"{setup.get('source_firm', 'Source')} → {setup.get('target_system', 'Target')}" if configured else "Not configured",
+        "entities": ", ".join(p["scope"]) if configured else "None selected",
+        "contract": str(setup.get("canonical_version", "—")),
+        "migration_id": migration_id,
+    }
+    return {"steps": steps, "step_tasks": tasks, "current_step": current, "status_chip": {"label": chip[0], "tone": chip[1]}, "facts": facts}
+
+
+def render_template_with_context(request: Request, template_name: str, extra_context: dict):
+    base_context = {
+        "request": request,
+        "migration_id": state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"),
+        "firm_name": state_store.questionnaire_data.get("firm_name", "New Migration"),
+        "adls_connected": state_store.adls_connected,
+        "adls_container": state_store.adls_container,
+        "kernel_specs": getattr(state_store, "kernel_specs", {}),
+        "progress": workflow_progress(),
+        "demo_mode": session_mgr.demo_mode,
+    }
+    _sess = session_mgr.get_session(request)
+    if _sess:
+        _allowed = session_mgr.assigned_roles(_sess.get("email", "")) or {_sess.get("role")}
+        base_context["persona_options"] = [r for r in session_mgr.ALL_ROLES if r in _allowed]
+        base_context["active_persona"] = _sess.get("role")
+        base_context["trole"] = _TEMPLATE_ROLE.get(_sess.get("role"), "IL")
+    base_context.update(extra_context)
+    return templates.TemplateResponse(request=request, name=template_name, context=base_context)
+
+
+# --- AUTHENTICATION ROUTES ---
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request, error: str = None, notice: str = None):
+    demo_user = next(iter(session_mgr.authorized_users.values()), None) if session_mgr.demo_mode else None
+    demo_email = next(iter(session_mgr.authorized_users.keys()), "") if session_mgr.demo_mode else ""
+    return templates.TemplateResponse(request=request, name="login.html", context={
+        "error": error,
+        "notice": notice,
+        "demo_mode": bool(demo_user),
+        "demo_email": demo_email,
+    })
+
+
+@app.post("/login")
+async def process_login(email: str = Form(...), password: str = Form(...)):
+    # Authentication and persona selection are intentionally separate steps.
+    session_id = session_mgr.authenticate(email, password, session_mgr.default_role_for(email))
+    if not session_id:
+        return RedirectResponse(url="/login?error=" + quote_plus(session_mgr.last_error), status_code=status.HTTP_303_SEE_OTHER)
+    response = RedirectResponse(url="/suite", status_code=status.HTTP_303_SEE_OTHER)
+    response.set_cookie(key="session_id", value=session_id, httponly=True, samesite="lax")
+    return response
+
+
+@app.get("/healthz")
+async def healthz():
+    """Public status for the host owner: which commit is running and whether account setup looks right. No emails, no secrets."""
+    conn = get_db_connection()
+    try:
+        users = user_registry.list_users(conn)
+        conn.commit()
+    finally:
+        conn.close()
+    boot = user_registry.bootstrap_admin_email()
+    reg = next((u for u in users if u["email"] == boot), None) if boot else None
+    return {"status": "ok", "database": "postgresql" if using_postgres() else "sqlite", "commit": (os.getenv("RENDER_GIT_COMMIT") or "unknown")[:7], "registration_page": True,
+            "bootstrap_admin_configured": bool(boot), "bootstrap_admin_is_demo_email": bool(boot) and boot in session_mgr.authorized_users,
+            "bootstrap_admin_registered": bool(reg), "bootstrap_admin_status": reg["status"] if reg else None,
+            "registered_users": len(users), "active_admins": sum(1 for u in users if u["status"] == "ACTIVE" and "Platform Admin" in u["roles"])}
+
+
+@app.get("/register", response_class=HTMLResponse)
+async def register_page(request: Request, error: str = "", notice: str = ""):
+    return templates.TemplateResponse(request=request, name="register.html", context={"error": error, "notice": notice})
+
+
+@app.post("/register")
+async def register_account(name: str = Form(""), email: str = Form(""), password: str = Form(""), confirm: str = Form(""), website: str = Form("")):
+    """Public self-registration. Accounts are pending (no roles) until a Platform Admin approves them; only the bootstrap admin is active at once."""
+    def back(key: str, message: str):
+        return RedirectResponse(url=f"/register?{key}=" + quote_plus(message), status_code=status.HTTP_303_SEE_OTHER)
+    if website.strip():  # honeypot: real people never fill this hidden field
+        return back("notice", "Registration received.")
+    problem = user_registry.validate_registration(name, email, password, confirm)
+    if problem:
+        return back("error", problem)
+    conn = get_db_connection()
+    try:
+        try:
+            result = user_registry.register(conn, name, email, password, set(session_mgr.authorized_users), user_registry.bootstrap_admin_email())
+        except ValueError as exc:
+            return back("error", str(exc))
+        conn.commit()
+    finally:
+        conn.close()
+    _target_setup_audit("USER_REGISTERED", {"email": email.strip().lower(), "name": " ".join(name.split()), "role": "self-registration"}, {"status": result["status"], "bootstrap": result["bootstrap"]})
+    if result["status"] == "ACTIVE":
+        return RedirectResponse(url="/login?notice=" + quote_plus("Administrator account created. Sign in with the email and password you just chose."), status_code=status.HTTP_303_SEE_OTHER)
+    return back("notice", "Registration received. A Platform Admin must approve it and assign your roles before you can sign in.")
+
+
+@app.get("/api/admin/storage-status")
+async def storage_status(request: Request):
+    """Platform Admin only: which database is live and what it holds (table names, row counts, stored-file totals). No values are returned."""
+    user = get_current_user(request)
+    if user.get("role") not in PLATFORM_ROLES:
+        raise HTTPException(status_code=403, detail="Only a Platform Admin can view storage status.")
+    conn = get_db_connection()
+    try:
+        if using_postgres():
+            names = [r[0] for r in conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() ORDER BY table_name").fetchall()]
+        else:
+            names = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").fetchall()]
+        tables = {n: conn.execute(f'SELECT COUNT(*) FROM "{n}"').fetchone()[0] for n in names}
+        files = None
+        if "stored_files" in tables:
+            r = conn.execute("SELECT COUNT(*), COALESCE(SUM(size_bytes), 0) FROM stored_files").fetchone()
+            files = {"count": r[0], "total_bytes": int(r[1])}
+        events = {}
+        if "workflow_events" in tables:
+            events = {r[0]: r[1] for r in conn.execute("SELECT event_type, COUNT(*) FROM workflow_events GROUP BY event_type ORDER BY event_type").fetchall()}
+        users = {}
+        if "app_users" in tables:
+            users = {r[0]: r[1] for r in conn.execute("SELECT status, COUNT(*) FROM app_users GROUP BY status").fetchall()}
+        conn.commit()
+    finally:
+        conn.close()
+    return {"database": "postgresql" if using_postgres() else "sqlite", "tables": tables, "stored_files": files,
+            "workflow_events_by_type": events, "registered_users_by_status": users,
+            "active_migration_id": state_store.questionnaire_data.get("migration_id")}
+
+
+@app.get("/admin/users", response_class=HTMLResponse)
+async def admin_users_page(request: Request, notice: str = "", error: str = ""):
+    user = get_current_user(request)
+    if user.get("role") not in PLATFORM_ROLES:
+        return RedirectResponse(url="/?error=" + quote_plus("Only a Platform Admin manages users."), status_code=status.HTTP_303_SEE_OTHER)
+    conn = get_db_connection()
+    try:
+        users = user_registry.list_users(conn)
+        conn.commit()
+    finally:
+        conn.close()
+    demo = [{"email": e, "name": v["name"], "roles": v["roles"], "has_password": bool(v["password_sha256"])} for e, v in session_mgr.authorized_users.items()]
+    return render_template_with_context(request, "admin_users.html", {
+        "space": "tenant",
+        "page_title": "Users & access", "user_name": user["name"], "user_role": user["role"], "users": users, "demo_users": demo,
+        "all_roles": user_registry.ALL_ROLES, "notice": notice, "error": error})
+
+
+@app.post("/api/users/{email}/decision")
+async def decide_user(email: str, request: Request, action: str = Form(...)):
+    actor = get_current_user(request)
+    form = await request.form()
+    conn = get_db_connection()
+    try:
+        try:
+            updated = user_registry.decide(conn, actor["email"], email, action, [str(r) for r in form.getlist("roles")])
+        except ValueError as exc:
+            return RedirectResponse(url="/admin/users?error=" + quote_plus(str(exc)), status_code=status.HTTP_303_SEE_OTHER)
+        conn.commit()
+    finally:
+        conn.close()
+    for sid, sess in list(session_mgr.active_sessions.items()):  # a changed or disabled account must not keep an old session
+        if sess.get("email") == updated["email"]:
+            del session_mgr.active_sessions[sid]
+    _target_setup_audit("USER_ACCESS_CHANGED", actor, {"target": updated["email"], "action": action.upper(), "status": updated["status"], "roles": updated["roles"]})
+    return RedirectResponse(url="/admin/users?notice=" + quote_plus(f"{updated['email']}: {updated['status']}, roles {', '.join(updated['roles']) or 'none'}."), status_code=status.HTTP_303_SEE_OTHER)
+
+
+_TEMPLATE_ROLE = {"Platform Admin": "PA", "IMO Lead": "IL", "Migration Analyst": "MA", "Domain SME": "MA",
+                  "Validation Specialist": "VS", "Compliance Reviewer": "CR"}
+_SPACE_LINKS = {"index.html": "/suite", "data-migration.html": "/migrations", "deal-room.html": "/deal-room",
+                "governance.html": "/governance", "tenant.html": "/tenant"}
+
+
+def _space_page(request: Request, filename: str, live_note: str = "", patches=()) -> HTMLResponse:
+    """Serve a supplied suite-template space (Deal Room, Governance) behind the same sign-in, with links pointed at this app."""
+    user = get_current_user(request)
+    html = (Path(__file__).parent / "space_pages" / filename).read_text(encoding="utf-8")
+    html = re.sub(r"(?<![\w/.-])(index|data-migration|deal-room|governance|tenant)\.html", lambda m: _SPACE_LINKS[m.group(0)], html)
+    for old, new in patches:
+        html = html.replace(old, new, 1)
+    role = _TEMPLATE_ROLE.get(user.get("role"), "IL")
+    html = html.replace("<head>", f'<head><script>try{{localStorage.setItem("xodus.role","{role}")}}catch(e){{}}</script>', 1)
+    sess = session_mgr.get_session(request) or {}
+    allowed = session_mgr.assigned_roles(sess.get("email", "")) or {user.get("role")}
+    options = [r for r in session_mgr.ALL_ROLES if r in allowed]
+    # The template's own "Demo: view as" list is replaced by this app's persona selector so there is one source of truth.
+    persona_js = ("<script>(function(){var OPTS=" + json.dumps(options) + ",CUR=" + json.dumps(user.get("role")) + ";"
+                  "function fix(){var s=document.getElementById('xrole');if(!s||s.dataset.xp)return;s.dataset.xp='1';"
+                  "s.innerHTML=OPTS.map(function(r){return '<option'+(r==CUR?' selected':'')+'>'+r+'</option>'}).join('');"
+                  "var l=document.querySelector('label[for=xrole]');if(l){l.textContent='Persona';l.title='Your persona scopes the workspace; it does not grant extra permissions.'}"
+                  "var c=s.cloneNode(true);s.replaceWith(c);c.addEventListener('change',function(){"
+                  "fetch('/persona-selection',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+                  "body:'role='+encodeURIComponent(c.value)+'&next='+encodeURIComponent(location.pathname)}).then(function(){location.reload()})})}"
+                  "new MutationObserver(fix).observe(document.documentElement,{childList:true,subtree:true});fix()})()</script>")
+    html = re.sub(r"<body[^>]*>", lambda m: m.group(0) + persona_js + live_note, html, count=1)
+    return HTMLResponse(html)
+
+
+@app.get("/deal-room", response_class=HTMLResponse)
+async def deal_room_page(request: Request):
+    return _space_page(request, "deal-room.html")
+
+
+def _preview_note(text: str, href: str, link: str) -> str:
+    return ('<div style="background:#0B1F33;color:#fff;font:600 12.5px Inter,system-ui,sans-serif;padding:9px 20px;display:flex;gap:12px;flex-wrap:wrap;align-items:center">'
+            f'<span style="opacity:.8">Live in this build:</span><a href="{href}" style="color:#64D8EF">{link}</a><span style="opacity:.6">{text}</span></div>')
+
+
+@app.get("/tenant", response_class=HTMLResponse)
+async def tenant_settings_page(request: Request):
+    note = _preview_note("Brand, identity, roles and deployment defaults below are the template preview and are kept in this browser only.", "/admin/users", "Users &amp; access &rarr;")
+    return _space_page(request, "tenant.html", note)
+
+
+@app.get("/migrations", response_class=HTMLResponse)
+async def migrations_page(request: Request, notice: str = ""):
+    """All migrations of this firm: the active one and earlier ones. A finished migration can seed the next one as a template."""
+    user = get_current_user(request)
+    conn = get_db_connection()
+    try:
+        items = migration_registry.list_migrations(conn, str(state_store.questionnaire_data.get("migration_id", "")))
+    finally:
+        conn.close()
+    return render_template_with_context(request, "migrations.html", {
+        "page_title": "Migration workspaces", "user_name": user["name"], "user_role": user["role"], "migrations": items,
+        "can_start": user["role"] in SETUP_ROLES, "notice": notice, "lobby": True})
+
+
+@app.get("/migration-workspaces", response_class=HTMLResponse)
+async def migration_workspaces_page(request: Request, view: str = "workspaces"):
+    """Template views the live pipeline does not have yet (workspaces list, command center, validation rules, team). Sample data."""
+    view = view if view in {"workspaces", "command", "validation", "team"} else "workspaces"
+    ws = "null" if view == "workspaces" else "'ws-corecap'"
+    note = _preview_note("These workspace views show the template's sample data. The live CoreCap pipeline is in the Data Migration rail.", "/", "Open the live overview &rarr;")
+    return _space_page(request, "data-migration.html", note, patches=(("function session(){try{return JSON.parse(XS.get('xodus.dm.session',true)||'null')}catch(e){return null}}",
+                                                                       "function session(){return {id: SEEDED[XS.role()] || 'avery.chen', method: 'sso'}}"),  # already signed in to the suite: skip the template's own continue screen
+                                                                      ("var V={view:'workspaces',stage:'M3',level:'migration',sec:'profile',ws:null,",
+                                                                      f"var V={{view:'{view}',stage:'M3',level:'migration',sec:'profile',ws:{ws},"),))
+
+
+@app.get("/governance", response_class=HTMLResponse)
+async def governance_page(request: Request):
+    note = ('<div style="background:#0B1F33;color:#fff;font:600 12.5px Inter,system-ui,sans-serif;padding:9px 20px;display:flex;gap:12px;flex-wrap:wrap;align-items:center">'
+            '<span style="opacity:.8">Live in this build:</span><a href="/canonical-changes" style="color:#64D8EF">Canonical change requests &rarr;</a>'
+            '<span style="opacity:.6">The gate chain, integrity checks and audit trail below are the template preview.</span></div>')
+    return _space_page(request, "governance.html", note)
+
+
+@app.get("/suite", response_class=HTMLResponse)
+async def suite_home(request: Request):
+    """Signed-in suite landing: the same session opens each space. Only Data Migration is live in this pilot."""
+    user = get_current_user(request)
+    return render_template_with_context(request, "suite_home.html", {"user_name": user["name"], "user_role": user["role"]})
+
+
+@app.get("/continue-data-migration", response_class=HTMLResponse)
+async def continue_data_migration(request: Request):
+    """Entry screen for the Data Migration space: same session, no second password."""
+    user = get_current_user(request)
+    return render_template_with_context(request, "continue_data_migration.html", {"user_name": user["name"], "user_role": user["role"]})
+
+
+@app.post("/persona-selection")
+async def select_persona(request: Request, role: str = Form(...), next: str = Form("/suite")):
+    user = get_current_user(request)
+    if role not in (session_mgr.assigned_roles(user["email"]) or {user["role"]}):
+        raise HTTPException(status_code=403, detail="The selected persona is not assigned to this user.")
+    session_id = request.cookies.get("session_id")
+    if not session_id or not session_mgr.select_role(session_id, role):
+        raise HTTPException(status_code=403, detail="The selected persona is not available for this session.")
+    # Persona switching returns to the page the user was on; only same-site paths are accepted.
+    target = next if next.startswith("/") and not next.startswith("//") and "\\" not in next else "/suite"
+    return RedirectResponse(url=target, status_code=status.HTTP_303_SEE_OTHER)
+
+
+def _target_connection_status() -> Dict[str, Any]:
+    """Setup-page view of the target: one-time connection configuration, inference and confirmation state."""
+    conn = get_db_connection()
+    try:
+        cfg = target_connector.get_config(conn)
+        conn.commit()
+    finally:
+        conn.close()
+    return {"config": cfg}
+
+
+@app.get("/setup", response_class=HTMLResponse)
+async def setup_hub(request: Request):
+    """One place for the inputs a migration needs before data moves: configuration, target mapping, firm knowledge."""
+    user = get_current_user(request)
+    setup = state_store.questionnaire_data.get("migration_setup", {}) or {}
+    cfg = _target_connection_status().get("config") or {}
+    return render_template_with_context(request, "setup_hub.html", {
+        "page_title": "Setup", "user_name": user["name"], "user_role": user["role"],
+        "configured": bool(setup), "setup_entities": setup.get("entities") or [],
+        "target_confirmed": cfg.get("status") == "CONFIRMED", "target_system": setup.get("target_system", ""),
+        "knowledge_saved": str(state_store.questionnaire_data.get("last_updated") or "Not yet")[:10],
+    })
+
+
+@app.get("/migration-setup", response_class=HTMLResponse)
+async def migration_setup_page(request: Request, demo_loaded: str = "", error: str = "", new_migration: str = ""):
+    user = get_current_user(request)
+    setup = state_store.questionnaire_data.get("migration_setup", {})
+    template_prefill = state_store.questionnaire_data.get("migration_template") or {}
+    prefilled = bool(template_prefill) and not setup
+    if prefilled:
+        setup = template_prefill  # pre-fills the form only; nothing is in scope or approved until the setup is saved
+    return render_template_with_context(request, "migration_setup.html", {
+        "page_title":"Migration Setup", "user_name":user["name"], "user_role":user["role"], "setup":setup, "prefilled": prefilled,
+        "error": error, "can_configure": user["role"] in SETUP_ROLES, "can_load_demo": _can_load_demo(user),
+        "target_connection": _target_connection_status(),
+        "demo_loaded": demo_loaded == "1", "new_migration": new_migration == "1",
+        "demo_available": session_mgr.demo_mode,
+        "knowledge_docs": state_store.firm_knowledge_docs,
+    })
+
+
+@app.post("/api/migration/new")
+async def start_new_migration(request: Request):
+    """Begin a clean migration. Earlier migrations stay stored but isolated by migration_id;
+    firm knowledge assets are kept because they are platform knowledge, not migration data."""
+    user = get_current_user(request)
+    form = await request.form()
+    template_id = str(form.get("template_id", "")).strip()
+    previous_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    migration_id = f"MIG-{uuid.uuid4().hex[:10].upper()}"
+    prefill: Dict[str, Any] = {}
+    if template_id:
+        conn = get_db_connection()
+        try:
+            prefill = migration_registry.carry_over(conn, template_id)
+        finally:
+            conn.close()
+        if not prefill:
+            raise HTTPException(status_code=404, detail="That migration has no saved setup to use as a template.")
+    state_store.questionnaire_data["migration_template"] = prefill
+    state_store.entity_sample_files.clear()
+    state_store.entity_source_files.clear()
+    state_store.pipeline_runs.clear()
+    state_store.questionnaire_data["mapping_information_requests"] = []
+    state_store.questionnaire_data["migration_setup"] = {}
+    for stale in ("firm_name", "migration_name", "source_systems"):
+        state_store.questionnaire_data[stale] = ""  # the previous migration's name must not label the new one
+    state_store.questionnaire_data["migration_id"] = migration_id
+    for entity in ("Account", "Household", "Client"):
+        state_store.entity_scopes[entity] = "OUT_OF_SCOPE"
+    context_payload = {"migration_id": migration_id, "migration_setup": {}, "previous_migration_id": previous_id, "migration_template": prefill, "firm_name": "", "migration_name": "", "source_systems": ""}
+    publish_event("MIGRATION_CONTEXT_UPDATED", migration_id, "migration", migration_id, context_payload, user["name"])
+    publish_event(
+        "ENTITY_SCOPES_UPDATED", migration_id, "migration", migration_id,
+        {"scopes": {entity: "OUT_OF_SCOPE" for entity in ("Account", "Household", "Client")}}, user["name"],
+    )
+    return RedirectResponse(url="/migration-setup?new_migration=1" + ("&from_template=1" if prefill else ""), status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/api/migration/open")
+async def open_migration_workspace(request: Request):
+    """Make an earlier migration the active workspace again: its files, scope, mappings and requests are restored from the durable log.
+    Only one migration is worked on at a time, so this switches the workspace for everyone using this server."""
+    user = get_current_user(request)
+    form = await request.form()
+    target_id = str(form.get("migration_id", "")).strip()
+    conn = get_db_connection()
+    try:
+        context = migration_registry.latest_context(conn, target_id)
+    finally:
+        conn.close()
+    if not context:
+        raise HTTPException(status_code=404, detail="That migration has no saved setup to open.")
+    current_id = str(state_store.questionnaire_data.get("migration_id", ""))
+    if target_id != current_id:
+        state_store.entity_sample_files.clear()
+        state_store.entity_source_files.clear()
+        state_store.pipeline_runs.clear()
+        state_store.questionnaire_data["mapping_information_requests"] = []
+        state_store.questionnaire_data["migration_setup"] = {}
+        state_store.questionnaire_data["migration_template"] = {}
+        for entity in ("Account", "Household", "Client"):
+            state_store.entity_scopes[entity] = "OUT_OF_SCOPE"
+        # Becoming the latest context event makes this the active migration after a restart too.
+        publish_event("MIGRATION_CONTEXT_UPDATED", target_id, "migration", target_id, {**context, "reopened_from": current_id}, user["name"])
+        state_store.hydrate_from_durable_state()
+        _sync_mapping_information_requests(target_id)
+    destination = "/setup" if str(form.get("next", "")) == "/setup" else "/"  # fixed allow-list, never a free URL
+    return RedirectResponse(url=destination, status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/api/migration/setup")
+async def save_migration_setup(request: Request):
+    user = get_current_user(request)
+    form = await request.form()
+    # Explicit scope selection controls downstream P0 workflows.
+    allowed_entities = {"Account", "Household", "Client"}
+    selected_entities = [entity for entity in form.getlist("entities") if entity in allowed_entities]
+    if not selected_entities:
+        raise HTTPException(status_code=400, detail="Select at least one in-scope entity: Account, Household, or Client.")
+    setup = {
+        "migration_name": str(form.get("migration_name", "")).strip(),
+        "source_firm": str(form.get("source_firm", "CoreCap")).strip() or "CoreCap",
+        "target_system": str(form.get("target_system", "")).strip(),
+        "canonical_version": str(form.get("canonical_version", "")).strip(),
+        "target_owner": str(form.get("target_owner", "")).strip(),
+        "azure_tenant_id": str(form.get("azure_tenant_id", "")).strip(),
+        "azure_subscription_id": str(form.get("azure_subscription_id", "")).strip(),
+        "azure_resource_group": str(form.get("azure_resource_group", "")).strip(),
+        "azure_storage_account": str(form.get("azure_storage_account", "")).strip(),
+        "azure_container": str(form.get("azure_container", "")).strip(),
+        "azure_access_method": str(form.get("azure_access_method", "PENDING")).strip(),
+        "knowledge_schema_ref": str(form.get("knowledge_schema_ref", "")).strip(),
+        "knowledge_rules_ref": str(form.get("knowledge_rules_ref", "")).strip(),
+        "knowledge_sme": str(form.get("knowledge_sme", "")).strip(),
+        "relationship_notes": str(form.get("relationship_notes", "")).strip(),
+        "source_acquisition": str(form.get("source_acquisition", "SAMPLE_FILES")).strip(),
+        "source_details": str(form.get("source_details", "")).strip(),
+        "entities": selected_entities,
+        "configured_by": user["name"],
+        "configuration_status": "CONFIGURED",
+    }
+    if not setup["target_system"] or not setup["canonical_version"]:
+        raise HTTPException(status_code=400, detail="Target system and canonical schema / contract reference are required before source mapping setup.")
+    # Target-first: a migration must reference the configured firm contract.
+    try:
+        firm_config = load_firm_config()
+    except FirmConfigError as exc:
+        raise HTTPException(status_code=409, detail=f"Firm configuration is required before migration setup. {exc}")
+    if setup["canonical_version"] != firm_config.canonical_contract_ref:
+        raise HTTPException(status_code=400, detail=f"Canonical contract reference must match the configured firm contract ({firm_config.canonical_contract_ref}).")
+    setup["firm_id"] = firm_config.firm_id
+    setup["firm_config_version"] = firm_config.version_id
+    if (state_store.questionnaire_data.get("migration_template") or {}).get("template_migration_id"):
+        setup["template_migration_id"] = state_store.questionnaire_data["migration_template"]["template_migration_id"]
+    if setup["source_acquisition"] == "AZURE_CONNECTION":
+        required_azure = ["azure_tenant_id", "azure_subscription_id", "azure_resource_group", "azure_storage_account", "azure_container"]
+        missing_azure = [field for field in required_azure if not setup.get(field)]
+        if missing_azure:
+            raise HTTPException(status_code=400, detail="Azure connection mode requires: " + ", ".join(missing_azure) + ".")
+    # Configuration metadata only: never store secrets or claim a live Azure connection.
+    current_migration_id = str(state_store.questionnaire_data.get("migration_id", ""))
+    if not current_migration_id or current_migration_id == "MIG-UNCONFIGURED":
+        state_store.questionnaire_data["migration_id"] = f"MIG-{uuid.uuid4().hex[:10].upper()}"
+    migration_id = str(state_store.questionnaire_data["migration_id"])
+    state_store.update_questionnaire_from_form({
+        "firm_name": setup["migration_name"],
+        "migration_name": setup["migration_name"],
+        "source_systems": setup["source_details"],
+        "target_system": setup["target_system"],
+        "source_systems": setup["source_details"],
+    })
+    state_store.questionnaire_data["migration_setup"] = setup
+    for entity in {"Account", "Household", "Client"}:
+        state_store.entity_scopes[entity] = "PENDING_DISCOVERY" if entity in selected_entities else "OUT_OF_SCOPE"
+    context_payload = {
+        "migration_id": migration_id,
+        "firm_name": setup["migration_name"],
+        "migration_name": setup["migration_name"],
+        "source_systems": setup["source_details"],
+        "target_system": setup["target_system"],
+        "migration_setup": setup,
+    }
+    publish_event("MIGRATION_CONTEXT_UPDATED", migration_id, "migration", migration_id, context_payload, user["name"])
+    publish_event(
+        "ENTITY_SCOPES_UPDATED", migration_id, "migration", migration_id,
+        {"scopes": {entity: state_store.entity_scopes[entity] for entity in ("Account", "Household", "Client")}},
+        user["name"],
+    )
+    state_store.audit_log.append({"event":"MIGRATION_SETUP_SAVED","actor":user["name"],"timestamp_utc":datetime.now(timezone.utc).isoformat(),"details":{"target_system":setup["target_system"],"source_acquisition":setup["source_acquisition"],"entities":selected_entities}})
+    return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/api/demo/load")
+async def load_demo_migration(request: Request):
+    """Load the sample migration from editable JSON/CSV/Markdown inputs, not code constants."""
+    user = get_current_user(request)
+    if not session_mgr.demo_mode:
+        raise HTTPException(status_code=404, detail="Demo mode is disabled.")
+    if not _can_load_demo(user):
+        raise HTTPException(status_code=403, detail="The one-click demo load is not enabled for this account.")
+    result = _run_demo_load(user)
+    loaded_files, registered_knowledge, target_note = result["loaded_files"], result["registered_knowledge"], result["target_note"]
+    return RedirectResponse(url="/?notice=" + quote_plus(f"Demo loaded: {len(loaded_files)} source files and {len(registered_knowledge)} knowledge assets registered.{target_note} Continue to source discovery to review each inferred file."), status_code=status.HTTP_303_SEE_OTHER)
+
+
+def _run_demo_load(user: Dict[str, str]) -> Dict[str, Any]:
+    """Create the demo migration from demo_data/ (shared by the one-click route and the first-start seed). Authorisation is the caller's job."""
+    manifest_path = Path(root_dir) / "demo_data" / "demo_migration.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=500, detail="Demo migration configuration could not be loaded.") from exc
+
+    setup = dict(manifest.get("migration_setup", {}))
+    if not setup.get("target_system") or not setup.get("canonical_version"):
+        raise HTTPException(status_code=500, detail="Demo migration configuration is missing target contract details.")
+    # Same gate as /api/migration/setup: no migration without a firm configuration.
+    try:
+        firm_config = load_firm_config()
+    except FirmConfigError as exc:
+        raise HTTPException(status_code=409, detail=f"Firm configuration is required before migration setup. {exc}")
+    if setup["canonical_version"] != firm_config.canonical_contract_ref:
+        raise HTTPException(status_code=400, detail=f"Canonical contract reference must match the configured firm contract ({firm_config.canonical_contract_ref}).")
+    setup["firm_id"] = firm_config.firm_id
+    setup["firm_config_version"] = firm_config.version_id
+
+    selected_entities = [entity for entity in setup.get("entities", ["Account", "Household", "Client"]) if entity in {"Account", "Household", "Client"}]
+    if not selected_entities:
+        raise HTTPException(status_code=500, detail="Demo migration must configure at least one in-scope entity.")
+    setup["entities"] = selected_entities
+    migration_id = f"MIG-{uuid.uuid4().hex[:10].upper()}"
+    state_store.questionnaire_data["migration_setup"] = setup
+    state_store.questionnaire_data["migration_id"] = migration_id
+    state_store.update_questionnaire_from_form({
+        "firm_name": setup.get("migration_name", ""),
+        "migration_name": setup.get("migration_name", ""),
+        "target_system": setup.get("target_system", ""),
+        "source_systems": setup.get("source_details", ""),
+    })
+    state_store.entity_sample_files.clear()
+    state_store.entity_source_files.clear()
+    state_store.firm_knowledge_docs.clear()
+    for entity in {"Account", "Household", "Client"}:
+        state_store.entity_scopes[entity] = "PENDING_DISCOVERY" if entity in selected_entities else "OUT_OF_SCOPE"
+
+    context_payload = {
+        "migration_id": migration_id,
+        "firm_name": setup.get("migration_name", ""),
+        "migration_name": setup.get("migration_name", ""),
+        "source_systems": setup.get("source_details", ""),
+        "target_system": setup.get("target_system", ""),
+        "migration_setup": setup,
+    }
+    state_store.questionnaire_data.update(context_payload)
+    publish_event("MIGRATION_CONTEXT_UPDATED", migration_id, "migration", migration_id, context_payload, user["name"])
+    publish_event(
+        "ENTITY_SCOPES_UPDATED", migration_id, "migration", migration_id,
+        {"scopes": {entity: state_store.entity_scopes[entity] for entity in ("Account", "Household", "Client")}},
+        user["name"],
+    )
+
+    loaded_files = []
+    for item in manifest.get("source_files", []):
+        source_path = (Path(root_dir) / item["path"]).resolve()
+        if not source_path.is_relative_to(Path(root_dir).resolve()):
+            raise HTTPException(status_code=400, detail="Demo source path is outside the repository.")
+        try:
+            content = source_path.read_bytes()
+            records = read_source_records(source_path.name, content)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=500, detail=f"Demo source file could not be read: {source_path.name}") from exc
+        headers = list(records[0].keys()) if records else []
+        source_context = str(item.get("context", ""))
+        dictionary_notes = str(item.get("dictionary_notes", ""))
+        from control_plane.services.entity_classification_agent import classify_source_file
+        inference = classify_source_file(
+            headers, records=records,
+            context=" ".join(part for part in (source_context, dictionary_notes) if part).strip(),
+        )
+        entity_name = inference.get("entity")
+        if inference.get("status") == "NEEDS_CLARIFICATION" or entity_name not in {"Account", "Household", "Client"}:
+            entity_name = "Needs clarification"
+        elif entity_name not in selected_entities:
+            loaded_files.append({"filename": source_path.name, "inferred_entity": entity_name, "status": "EXCLUDED_OUT_OF_SCOPE"})
+            continue
+        inferred_role = (
+            "RELATIONSHIP_EXTRACT" if inference.get("classification_type") == "RELATIONSHIP"
+            else "ACCOUNT_MASTER" if entity_name == "Account"
+            else "ENTITY_MASTER"
+        )
+        source_role = str(item.get("source_role") or inferred_role)
+        record = state_store.attach_entity_sample_file(entity_name, source_path.name, content, source_role=source_role)
+        record["inference"] = inference
+        record["inferred_entity"] = entity_name
+        record["inference_approval_status"] = "PENDING"
+        record["discovery_status"] = "PENDING_REVIEW"
+        record["source_context"] = source_context
+        record["data_dictionary_notes"] = dictionary_notes
+        publish_event(
+            "SOURCE_FILE_UPLOADED", migration_id, "source_file", str(record["file_id"]),
+            _workflow_safe_source_payload(record, entity_name, source_role), user["name"],
+        )
+        loaded_files.append({"filename": source_path.name, "inferred_entity": entity_name, "status": record["inference_approval_status"]})
+
+    knowledge_items = manifest.get("knowledge_files") or [
+        {"path": setup.get("knowledge_schema_ref", ""), "category": "data_dictionary"},
+        {"path": setup.get("knowledge_rules_ref", ""), "category": "transformation_rule"},
+        {"path": "demo_data/knowledge/corecap_business_rules.md", "category": "business_rules"},
+        {"path": "demo_data/knowledge/corecap_source_dictionary.json", "category": "data_dictionary"},
+        {"path": "demo_data/knowledge/simplicity_target_layouts.json", "category": "target_schema"},
+        {"path": "demo_data/knowledge/corecap_migration_decisions.md", "category": "source_analysis"},
+    ]
+    registered_knowledge = []
+    for item in knowledge_items:
+        relative_path = str(item.get("path", "")).strip()
+        if not relative_path:
+            continue
+        knowledge_path = (Path(root_dir) / relative_path).resolve()
+        if not knowledge_path.is_relative_to(Path(root_dir).resolve()):
+            raise HTTPException(status_code=400, detail="Demo knowledge path is outside the repository.")
+        try:
+            knowledge_content = knowledge_path.read_bytes()
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"Demo knowledge asset could not be read: {knowledge_path.name}") from exc
+        try:
+            doc = state_store.add_firm_file(knowledge_path.name, str(item.get("category", "mapping_reference")), knowledge_content)
+        except ValueError as exc:
+            raise HTTPException(status_code=500, detail=f"Demo knowledge asset could not be registered: {knowledge_path.name}") from exc
+        doc["source_path"] = relative_path
+        publish_event("KNOWLEDGE_ASSET_REGISTERED", migration_id, "knowledge_asset", doc["id"], doc, user["name"])
+        registered_knowledge.append(doc)
+
+    target_note = ""
+    target_audit = None
+    canonical_types = _canonical_types()  # read before the write transaction below: it opens its own connection
+    conn = get_db_connection()
+    try:
+        if target_connector.get_config(conn) is None:
+            try:
+                target_connector.configure(conn, user["name"], "Simplicity", os.environ.get("SIMULATED_TARGET_URL", "http://127.0.0.1:8100"), [], True, "")
+                cfg = target_connector.get_config(conn)
+                if cfg["status"] == "CONNECTED":
+                    target_connector.infer_model(conn, canonical_types)
+                    target_note = " Target system connected and inferred; an admin confirms it once on Target system & mapping."
+                else:
+                    target_note = f" Target system is not reachable ({cfg['connection_detail']}) Start it, then finish the one-time target setup."
+                target_audit = cfg["status"]
+            except ValueError as exc:
+                target_note = f" Target setup needs attention: {exc}"
+        conn.commit()
+    finally:
+        conn.close()
+    if target_audit:  # after the transaction is closed: the audit log writes through its own connection
+        state_store.audit_log.append({"event": "TARGET_SYSTEM_CONFIGURED", "actor": user["name"],
+                                      "timestamp_utc": datetime.now(timezone.utc).isoformat(), "details": {"via": "DEMO_LOAD", "status": target_audit}})
+    state_store.audit_log.append({
+        "event": "DEMO_MIGRATION_LOADED",
+        "actor": user["name"],
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "details": {"migration_name": setup.get("migration_name"), "source_files": loaded_files},
+    })
+    return {"loaded_files": loaded_files, "registered_knowledge": registered_knowledge, "target_note": target_note}
+
+
+def seed_demo_if_empty() -> str:
+    """First-start seed: when XODUS_SEED_DEMO=1, demo mode is on and no migration exists yet, load the demo template once.
+    Never overwrites an existing migration. Returns a short status string."""
+    if os.getenv("XODUS_SEED_DEMO", "").strip().lower() not in {"1", "true", "yes"}:
+        return "disabled"
+    if not session_mgr.demo_mode:
+        return "skipped: demo mode is off"
+    if state_store.questionnaire_data.get("migration_setup"):
+        return "skipped: a migration already exists"
+    conn = get_db_connection()
+    try:
+        earlier = migration_registry.list_migrations(conn, str(state_store.questionnaire_data.get("migration_id", "")))
+    finally:
+        conn.close()
+    if any(m["configured"] for m in earlier):
+        return "skipped: an earlier migration exists"  # e.g. a new migration was started and not configured yet; do not add a second demo
+    try:
+        result = _run_demo_load({"name": "System seed"})
+    except HTTPException as exc:
+        return f"failed: {exc.detail}"
+    return f"seeded: {len(result['loaded_files'])} source files, {len(result['registered_knowledge'])} knowledge assets"
+
+
+@app.on_event("startup")
+async def _seed_on_startup() -> None:
+    logging.getLogger("xodus.seed").info("demo seed: %s", seed_demo_if_empty())
+
+
+@app.post("/api/relationships/review")
+async def review_relationship_candidate(request: Request, child: str = Form(...), parent: str = Form(...), decision: str = Form(...), reason: str = Form("")):
+    """Analyst/Admin confirms or rejects a detected relationship. Confirmation is evidence only: nothing is joined or merged."""
+    user = get_current_user(request)
+    migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    conn = get_db_connection()
+    try:
+        try:
+            cross_file.review_relationship(conn, migration_id, child, parent, decision, reason, user["name"])
+        except ValueError as exc:
+            return RedirectResponse(url="/entity-sample-files?error=" + quote_plus(str(exc)) + "#cross-file-analysis", status_code=status.HTTP_303_SEE_OTHER)
+        conn.commit()
+    finally:
+        conn.close()
+    _target_setup_audit("RELATIONSHIP_" + decision.strip().upper(), user, {"child": child, "parent": parent})
+    return RedirectResponse(url="/entity-sample-files?notice=" + quote_plus(f"Relationship {child} -> {parent} {decision.strip().lower()}.") + "#cross-file-analysis", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.get("/agent-studio", response_class=HTMLResponse)
+async def agent_studio(request: Request):
+    return RedirectResponse(url="/entity-sample-files", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/api/agents/analyze/{file_id}")
+async def analyze_source_file_with_agents(request: Request, file_id: str):
+    user = get_current_user(request)
+    setup = state_store.questionnaire_data.get("migration_setup", {})
+    selected = [e for e in setup.get("entities", []) if e in {"Account", "Household", "Client"}]
+    if not selected:
+        raise HTTPException(status_code=400, detail="Select at least one in-scope entity in Migration Setup first.")
+    found = None
+    for entity, entity_files in state_store.entity_source_files.items():
+        for record in entity_files.values():
+            if record.get("file_id") == file_id:
+                found = (entity, record)
+                break
+        if found:
+            break
+    if not found:
+        raise HTTPException(status_code=404, detail="Source file was not found.")
+    entity, record = found
+    try:
+        content = file_store.read_bytes(record["stored_path"])
+        records = read_source_records(record["filename"], content)
+        analysis = MigrationAgentCoordinator().analyze(
+            records, context=record.get("source_context", ""),
+            in_scope=selected,
+        )
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="The source file could not be analyzed.") from exc
+    analysis["file_id"] = file_id
+    analysis["filename"] = record["filename"]
+    analysis["analyzed_by"] = user["name"]
+    analysis["analyzed_utc"] = datetime.now(timezone.utc).isoformat()
+    record["agent_analysis"] = analysis
+    state_store.audit_log.append({
+        "event": "P0_AGENT_ANALYSIS_COMPLETED", "actor": user["name"],
+        "timestamp_utc": analysis["analyzed_utc"],
+        "details": {"file_id": file_id, "filename": record["filename"],
+                    "scope": selected, "classification_status": analysis["classification"].get("status")},
+    })
+    return RedirectResponse(url="/entity-sample-files", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.get("/logout")
+async def logout(request: Request):
+    session_id = request.cookies.get("session_id")
+    if session_id:
+        session_mgr.logout(session_id)
+    response = RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
+    response.delete_cookie("session_id")
+    return response
+
+
+# --- WORKBENCH MODULE ROUTES ---
+
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
+async def dashboard_overview(request: Request):
+    user = get_current_user(request)
+    return render_template_with_context(
+        request=request,
+        template_name="dashboard.html",
+        extra_context={
+            "page_title": "Migration Dashboard",
+            "my_queue": build_queue(user["role"], workflow_progress()),
+            "can_load_demo": _can_load_demo(user),
+            "notice": request.query_params.get("notice", ""),
+            "user_name": user["name"],
+            "user_role": user["role"],
+            "dashboard": state_store.generated_dashboard,
+            "migration_setup": state_store.questionnaire_data.get("migration_setup", {}),
+            "knowledge_docs_count": len(state_store.firm_knowledge_docs),
+            "in_scope_entities": [entity for entity in ("Account", "Household", "Client") if entity in state_store.questionnaire_data.get("migration_setup", {}).get("entities", [])],
+            "wave_conditions": CohortConditionEngine.get_condition_catalog(),
+            "required_fields_by_entity": {entity: SchemaMapperAgent.required_fields(entity) for entity in ("Account", "Household", "Client")},
+            "entity_approval_summary": {
+                entity: {
+                    "total": len(state_store.entity_source_files.get(entity, {})),
+                    "approved": sum(1 for item in state_store.entity_source_files.get(entity, {}).values() if item.get("inference_approval_status") == "APPROVED"),
+                    "pending": sum(1 for item in state_store.entity_source_files.get(entity, {}).values() if item.get("inference_approval_status") not in {"APPROVED", "REJECTED"}),
+                    "rejected": sum(1 for item in state_store.entity_source_files.get(entity, {}).values() if item.get("inference_approval_status") == "REJECTED"),
+                } for entity in state_store.questionnaire_data.get("migration_setup", {}).get("entities", [])
+            }
+        }
+    )
+
+
+@app.get("/firm-knowledge", response_class=HTMLResponse)
+async def firm_knowledge_studio(request: Request):
+    user = get_current_user(request)
+    return render_template_with_context(
+        request=request,
+        template_name="firm_knowledge.html",
+        extra_context={
+            "page_title": "Knowledge Assets",
+            "user_name": user["name"],
+            "user_role": user["role"],
+            "can_edit_knowledge": user["role"] in DISCOVERY_ROLES,
+            "form": state_store.questionnaire_data,
+            "docs": state_store.firm_knowledge_docs
+        }
+    )
+
+
+@app.get("/entity-selection", response_class=HTMLResponse)
+async def entity_selection_view(request: Request):
+    # Entity scope is now part of source discovery and human confirmation, not a separate manual pre-step.
+    get_current_user(request)
+    return RedirectResponse(url="/entity-sample-files", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.get("/entity-sample-files", response_class=HTMLResponse)
+async def entity_sample_files_view(request: Request, uploaded: str = "", notice: str = "", error: str = ""):
+    user = get_current_user(request)
+    source_uploads = []
+    migration_setup = state_store.questionnaire_data.get("migration_setup", {})
+    in_scope_entities = set(migration_setup.get("entities", []))
+    for entity, files in getattr(state_store, "entity_source_files", {}).items():
+        for file_id, record in files.items():
+            inferred_entity = "Needs clarification" if entity == "Needs clarification" else (record.get("inference", {}).get("entity") or entity)
+            selected = inferred_entity in in_scope_entities
+            review_status = record.get("inference_approval_status", "PENDING")
+            display_status = "NEEDS_CLARIFICATION" if inferred_entity not in {"Account", "Household", "Client"} else "OUT_OF_SCOPE" if not selected else review_status
+            source_uploads.append({**record, "file_id": record.get("file_id", file_id), "inferred_entity": inferred_entity, "display_status": display_status, "scope_eligible": selected})
+    source_uploads.sort(key=lambda item: item.get("uploaded_at", ""), reverse=True)
+    cross = None
+    loaded = []
+    for item in source_uploads:
+        stored = item.get("stored_path")
+        if item.get("inference_approval_status") == "REJECTED" or not stored or not file_store.is_file(stored) or len(loaded) >= 12:
+            continue
+        try:
+            loaded.append({"name": item.get("filename", "source"), "entity": item["inferred_entity"],
+                           "rows": read_source_records(item.get("filename", "source.csv"), file_store.read_bytes(stored))})
+        except (OSError, ValueError):
+            continue
+    if len(loaded) >= 2:
+        cross = cross_file.analyze(loaded)
+        conn = get_db_connection()
+        try:
+            cross_file.attach_reviews(conn, str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED")), cross)
+            conn.commit()
+        finally:
+            conn.close()
+    return render_template_with_context(
+        request=request,
+        template_name="entity_sample_files.html",
+        extra_context={
+            "page_title": "Source Discovery & Entity Inference",
+            "can_discover": user["role"] in DISCOVERY_ROLES,
+            "user_name": user["name"],
+            "user_role": user["role"],
+            "selected_entities": state_store.get_source_upload_entities(),
+            "in_scope_entities": in_scope_entities,
+            "source_uploads": source_uploads, "cross_file": cross,
+            "uploaded_entity": uploaded,
+            "notice": notice,
+            "error": error,
+            "acquisition_method": state_store.questionnaire_data.get("migration_setup", {}).get("source_acquisition", "SAMPLE_FILES"),
+            "knowledge_docs": state_store.firm_knowledge_docs,
+            "entity_approval_summary": {
+                entity: {
+                    "total": len(state_store.entity_source_files.get(entity, {})),
+                    "approved": sum(1 for item in state_store.entity_source_files.get(entity, {}).values() if item.get("inference_approval_status") == "APPROVED"),
+                    "pending": sum(1 for item in state_store.entity_source_files.get(entity, {}).values() if item.get("inference_approval_status") not in {"APPROVED", "REJECTED"}),
+                    "rejected": sum(1 for item in state_store.entity_source_files.get(entity, {}).values() if item.get("inference_approval_status") == "REJECTED"),
+                } for entity in state_store.questionnaire_data.get("migration_setup", {}).get("entities", [])
+            },
+        }
+    )
+
+
+MAPPING_REVIEW_ROLES = APPROVAL_ROLES
+
+
+@app.get("/agent-pipeline", response_class=HTMLResponse)
+async def agent_pipeline_view(request: Request, notice: str = "", error: str = ""):
+    user = get_current_user(request)
+    latest_run = state_store.pipeline_runs[-1] if state_store.pipeline_runs else None
+    active_migration_id = str(state_store.questionnaire_data.get("migration_id", "UNCONFIGURED"))
+    _sync_mapping_information_requests(active_migration_id)
+    conn = get_db_connection()
+    try:
+        selected_scope = [e for e in state_store.questionnaire_data.get("migration_setup", {}).get("entities", []) if e in {"Account", "Household", "Client"}]
+        scope_placeholders = ", ".join("?" for _ in selected_scope) or "''"
+        rows = conn.execute(
+            f"""
+            SELECT s.suggestion_id, s.entity_name, s.source_field, s.canonical_field,
+                   s.proposed_rule, s.confidence_score, s.inference_basis
+            FROM mapping_suggestions AS s
+            WHERE s.migration_id = ? AND s.status = 'PENDING'
+              AND s.entity_name IN ({scope_placeholders})
+              AND NOT EXISTS (
+                  SELECT 1 FROM canonical_mappings AS c
+                  WHERE c.migration_id = s.migration_id
+                    AND c.entity_name = s.entity_name
+                    AND c.source_field = s.source_field
+                    AND c.canonical_field = s.canonical_field
+                    AND c.is_confirmed = 1
+              )
+            ORDER BY s.entity_name, s.created_utc DESC, s.source_field
+            """,
+            (active_migration_id, *selected_scope),
+        ).fetchall()
+        mapping_suggestions = [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+    source_files = {
+        entity: dict(files)
+        for entity, files in getattr(state_store, "entity_source_files", {}).items()
+        if entity in selected_scope and entity in {"Account", "Household", "Client"}
+    }
+    for entity, record in getattr(state_store, "entity_sample_files", {}).items():
+        if entity in selected_scope and entity in {"Account", "Household", "Client"}:
+            source_files.setdefault(entity, {}).setdefault(record.get("source_role", "ENTITY_MASTER"), record)
+
+    return render_template_with_context(
+        request=request,
+        template_name="agent_pipeline.html",
+        extra_context={
+            "page_title": "Schema Mapper · Mapping Studio",
+            "user_name": user["name"],
+            "user_role": user["role"],
+            "can_review_mappings": user["role"] in MAPPING_REVIEW_ROLES,
+            "can_discover": user["role"] in DISCOVERY_ROLES,
+            "can_answer_rfi": user["role"] in DEFINITION_ROLES,
+            "approved_rules": transformation_rules.approved_rules(),
+            "builtin_rules": sorted(SchemaMapperAgent.SUPPORTED_APPROVED_TRANSFORMS),
+            "canonical_fields": _canonical_field_lists(),
+            "firm_context": state_store.questionnaire_data,
+            "pipeline_run": latest_run,
+            "source_files": source_files,
+            "mapping_suggestions": mapping_suggestions,
+            "rule_hints": _rule_hints(mapping_suggestions),
+            "information_requests": [item for item in state_store.questionnaire_data.get("mapping_information_requests", []) if item.get("entity") in selected_scope and str(item.get("migration_id", active_migration_id)) == active_migration_id],
+            "notice": notice,
+            "error": error,
+        }
+    )
+
+
+@app.get("/hitl", response_class=HTMLResponse)
+async def hitl_approval_queue(request: Request):
+    """P0 human approval lives in the source-to-canonical mapping review."""
+    get_current_user(request)
+    return RedirectResponse(url="/agent-pipeline#pending-mappings", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.get("/reconciliation", response_class=HTMLResponse)
+async def reconciliation_dashboard(request: Request, error: str = "", notice: str = ""):
+    return _validation_stage_view(request, "reconcile", error, notice)
+
+
+@app.get("/validation-rules", response_class=HTMLResponse)
+async def validation_rules_page(request: Request, error: str = "", notice: str = ""):
+    """Stage 06: the scenarios that extend the validation run, defined after the data plane has executed."""
+    return _validation_stage_view(request, "rules", error, notice)
+
+
+@app.get("/execution", response_class=HTMLResponse)
+async def execution_page(request: Request, error: str = "", notice: str = ""):
+    """Stage 05: simulated data-plane execution of the deployment package."""
+    return _validation_stage_view(request, "execution", error, notice)
+
+
+def _validation_stage_view(request: Request, view: str, error: str, notice: str):
+    user = get_current_user(request)
+    migration_id = state_store.questionnaire_data.get("migration_id", "UNCONFIGURED")
+    conn = get_db_connection()
+    try:
+        approved_mappings = [
+            dict(row) for row in conn.execute(
+                """
+                SELECT c.entity_name, c.source_field, c.canonical_field,
+                       c.mapping_type, c.transformation_expression, c.confidence_score,
+                       c.created_by, c.updated_utc, c.migration_id,
+                       s.status AS review_status, s.reviewer, s.review_comments,
+                       s.reviewed_utc, s.run_id
+                FROM canonical_mappings AS c
+                LEFT JOIN mapping_suggestions AS s
+                  ON s.migration_id = c.migration_id
+                 AND s.entity_name = c.entity_name
+                 AND s.source_field = c.source_field
+                 AND s.canonical_field = c.canonical_field
+                 AND s.status = 'APPROVED'
+                WHERE c.migration_id = ? AND c.is_confirmed = 1
+                ORDER BY c.entity_name, c.source_field
+                """,
+                (migration_id,),
+            ).fetchall()
+        ]
+        pending_count = conn.execute(
+            """
+            SELECT COUNT(*) AS count FROM mapping_suggestions AS s
+            WHERE s.migration_id = ? AND s.status = 'PENDING'
+              AND NOT EXISTS (
+                SELECT 1 FROM canonical_mappings AS c
+                WHERE c.migration_id = s.migration_id
+                  AND c.entity_name = s.entity_name
+                  AND c.source_field = s.source_field
+                  AND c.canonical_field = s.canonical_field
+                  AND c.is_confirmed = 1
+              )
+            """,
+            (migration_id,),
+        ).fetchone()["count"]
+        mapping_runs = [
+            dict(row) for row in conn.execute(
+                """
+                SELECT run_id, entity_name, source_record_count, confidence_score, status, executed_by, executed_utc
+                FROM migration_runs WHERE migration_id = ?
+                ORDER BY executed_utc DESC LIMIT 25
+                """,
+                (migration_id,),
+            ).fetchall()
+        ]
+        mapping_lineage = [
+            dict(row) for row in conn.execute(
+                """
+                SELECT l.entity_name, l.source_column, l.canonical_column, l.applied_rule,
+                       l.validation_status, l.actor, l.timestamp_utc, l.run_id
+                FROM field_lineage_audit AS l
+                JOIN migration_runs AS r ON r.run_id = l.run_id
+                WHERE r.migration_id = ?
+                ORDER BY l.timestamp_utc DESC LIMIT 100
+                """,
+                (migration_id,),
+            ).fetchall()
+        ]
+        latest = conn.execute(
+            "SELECT run_id, status, results_json, executed_by, executed_utc FROM validation_runs "
+            "WHERE migration_id = ? ORDER BY executed_utc DESC LIMIT 1", (migration_id,)).fetchone()
+        scenarios = validation_scenarios.list_scenarios(conn, migration_id)
+        runs = execution_simulator.list_runs(conn, migration_id)
+        has_package = bool(package_contract.list_packages(conn, migration_id))
+        stored_signoff = artifact_store.list_artifacts(conn, migration_id, "SIGNOFF_EVIDENCE")
+        adf_status = _adf_status(conn, migration_id)
+        adf_deployment = adf_simulator.latest(conn, migration_id)
+        adf_trigger_blocker = adf_simulator.trigger_blocker(adf_deployment, adf_status["stale_reasons"] if adf_status else None, adf_status["latest"]["artifact_id"] if adf_status else None)
+        exceptions = validation_scenarios.list_exceptions(conn, migration_id, latest["run_id"] if latest else "-")
+        conn.commit()
+    finally:
+        conn.close()
+    validation_run = None
+    if latest:
+        validation_run = {"run_id": latest["run_id"], "executed_by": latest["executed_by"],
+                          "executed_utc": latest["executed_utc"], **json.loads(latest["results_json"])}
+        validation_run["effective_status"] = validation_scenarios.effective_status(validation_run["checks"], exceptions)
+    return render_template_with_context(
+        request=request,
+        template_name="reconciliation.html",
+        extra_context={
+            "page_title": {"rules": "Validation rules", "execution": "Execution"}.get(view, "Reconciliation"),
+            "view": view,
+            "user_name": user["name"],
+            "user_role": user["role"],
+            "pipeline_runs": state_store.pipeline_runs,
+            "drift_gate": state_store.questionnaire_data.get("aum_drift_gate", "0.50%"),
+            "approved_mappings": approved_mappings,
+            "pending_mapping_count": pending_count,
+            "mapping_runs": mapping_runs,
+            "mapping_lineage": mapping_lineage,
+            "migration_id": migration_id,
+            "validation_run": validation_run, "error": error, "notice": notice, "stored_signoff": stored_signoff, "adf_status": adf_status, "adf_deployment": adf_deployment, "adf_trigger_blocker": adf_trigger_blocker,
+            "can_run_validation": user["role"] in VALIDATION_ROLES,
+            "drift": drift_detection.detect(approved_mappings, state_store.entity_source_files),
+            "scenarios": scenarios, "check_types": validation_scenarios.CHECK_TYPES, "exec_runs": runs, "has_package": has_package,
+            "exceptions": {e["check_ref"]: e for e in exceptions}, "can_decide_exception": user["role"] in APPROVAL_ROLES, "can_review_failures": user["role"] in APPROVAL_ROLES,
+            "current_user_name": user["name"],
+        }
+    )
+
+
+def _run_simulated_execution(user, migration_id: str, outage: str = "", retry_of: str = ""):
+    """Run the latest deployment package through the SIMULATED data plane and record telemetry. Returns (run_id, telemetry, package) or (None, error, None)."""
+    import time as _time
+    conn = get_db_connection()
+    try:
+        latest = package_contract.list_packages(conn, migration_id)
+        pkg_row = package_contract.get_package(conn, latest[0]["package_id"]) if latest else None
+        try:
+            if not pkg_row:
+                raise ValueError("Generate a deployment package first (Target system & mapping).")
+            if retry_of:
+                execution_simulator.retry_allowed(conn, retry_of)
+            package = package_contract.validate_text(pkg_row["yaml_text"]).model_dump()
+        except ValueError as exc:
+            return None, str(exc), None
+        conn.commit()
+    finally:
+        conn.close()
+    started = datetime.now(timezone.utc)
+    t0 = _time.perf_counter()
+    rows = {} if outage == "on" else _canonical_rows_for_migration(migration_id)[0]
+    telemetry = execution_simulator.simulate(package, rows, outage == "on")
+    duration = int((_time.perf_counter() - t0) * 1000)
+    conn = get_db_connection()
+    try:
+        rid = execution_simulator.record_run(conn, migration_id, package, user["name"], telemetry, started, duration, retry_of or None)
+        conn.commit()
+    finally:
+        conn.close()
+    return rid, telemetry, package
+
+
+@app.post("/api/execution/run")
+async def run_simulated_execution(request: Request, outage: str = Form(""), retry_of: str = Form("")):
+    """Run the latest deployment package through the SIMULATED data plane and record telemetry. Nothing leaves this platform."""
+    user = get_current_user(request)
+    migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    rid, telemetry, package = _run_simulated_execution(user, migration_id, outage, retry_of)
+    if rid is None:
+        return RedirectResponse(url="/execution?error=" + quote_plus(telemetry), status_code=status.HTTP_303_SEE_OTHER)
+    _target_setup_audit("EXECUTION_SIMULATED_RUN", user, {"run_id": rid, "package_id": package["meta"]["package_id"], "status": telemetry["status"], "retry_of": retry_of or None})
+    return RedirectResponse(url="/execution?notice=" + quote_plus(f"SIMULATED run {rid}: {telemetry['status']}. No data left this platform."),
+                            status_code=status.HTTP_303_SEE_OTHER)
+
+
+def _execution_redirect(key: str, message: str):
+    return RedirectResponse(url=f"/execution?{key}=" + quote_plus(message), status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/api/adf/simulated-deploy")
+async def adf_simulated_deploy(request: Request):
+    """Deploy the latest stored ADF package into a fictitious factory. Nothing is sent to Azure."""
+    user = get_current_user(request)
+    migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    conn = get_db_connection()
+    try:
+        art = artifact_store.latest(conn, migration_id, "ADF_PACKAGE")
+        if not art:
+            return _execution_redirect("error", "Save an ADF package first (Target system & mapping).")
+        try:
+            data = artifact_store.read(conn, art["artifact_id"])["data"]
+        except ValueError as exc:
+            return _execution_redirect("error", str(exc))
+        dep = adf_simulator.deploy(conn, migration_id, art, data, user["name"])
+        conn.commit()
+    finally:
+        conn.close()
+    _target_setup_audit("ADF_SIMULATED_DEPLOY", user, {"deployment_id": dep["deployment_id"], "artifact_id": art["artifact_id"], "status": dep["status"], "errors": len(dep["errors"])})
+    if dep["status"] != "DEPLOYED_SIMULATED":
+        return _execution_redirect("error", f"Simulated deployment {dep['deployment_id']} rejected: " + " ".join(dep["errors"][:3]))
+    return _execution_redirect("notice", f"Package v{art['artifact_version']} deployed to the SIMULATED factory {dep['factory_name']} ({dep['deployment_id']}); {len(dep['resources'])} resources. Nothing reached Azure.")
+
+
+@app.post("/api/adf/simulated-trigger")
+async def adf_simulated_trigger(request: Request):
+    """Trigger the deployed pipeline in the simulated factory; it runs on the simulated data plane."""
+    user = get_current_user(request)
+    migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    conn = get_db_connection()
+    try:
+        dep = adf_simulator.latest(conn, migration_id)
+        status_info = _adf_status(conn, migration_id)
+        blocker = adf_simulator.trigger_blocker(dep, status_info["stale_reasons"] if status_info else None, status_info["latest"]["artifact_id"] if status_info else None)
+    finally:
+        conn.close()
+    if blocker:
+        return _execution_redirect("error", blocker)
+    rid, telemetry, package = _run_simulated_execution(user, migration_id)
+    if rid is None:
+        return _execution_redirect("error", telemetry)
+    conn = get_db_connection()
+    try:
+        adf_run = adf_simulator.record_trigger(conn, dep["deployment_id"], rid, user["name"])
+        conn.commit()
+    finally:
+        conn.close()
+    _target_setup_audit("ADF_SIMULATED_TRIGGER", user, {"deployment_id": dep["deployment_id"], "adf_run_id": adf_run, "run_id": rid, "status": telemetry["status"]})
+    return _execution_redirect("notice", f"Pipeline triggered in the SIMULATED factory ({adf_run}): {telemetry['status']}. No data left this platform.")
+
+
+@app.post("/api/execution/runs/{run_id}/failures/{idx}/review")
+async def review_execution_failure(request: Request, run_id: str, idx: int, decision: str = Form(...), reason: str = Form("")):
+    """Acknowledge or resolve a problem found by a simulated run. Analyst/Admin only; recorded with the reviewer from the session."""
+    user = get_current_user(request)
+    conn = get_db_connection()
+    try:
+        try:
+            res = execution_simulator.review_failure(conn, run_id, idx, decision, reason, user["name"])
+        except ValueError as exc:
+            return RedirectResponse(url="/execution?error=" + quote_plus(str(exc)), status_code=status.HTTP_303_SEE_OTHER)
+        conn.commit()
+    finally:
+        conn.close()
+    f = res["failure"]
+    _target_setup_audit("EXECUTION_PROBLEM_" + res["status"], user, {"run_id": run_id, "entity": f["entity"], "table": f["table"], "column": f["column"], "rule": f["rule"]})
+    return RedirectResponse(url="/execution?notice=" + quote_plus(f"Problem on {f['entity']}.{f['table']}.{f['column']} marked {res['status'].lower()}."),
+                            status_code=status.HTTP_303_SEE_OTHER)
+
+
+def _validation_redirect(key: str, message: str):
+    return RedirectResponse(url=f"/reconciliation?{key}=" + quote_plus(message) + "#validation-results", status_code=status.HTTP_303_SEE_OTHER)
+
+
+def _scenario_redirect(key: str, message: str):
+    return RedirectResponse(url=f"/validation-rules?{key}=" + quote_plus(message), status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/api/validation/scenarios")
+async def create_validation_scenario(request: Request, entity_name: str = Form(...), check_type: str = Form(...), field_name: str = Form(""),
+                                     stage: str = Form("PRE"), description: str = Form(""), values: str = Form(""), min_value: str = Form(""),
+                                     max_value: str = Form(""), formats: str = Form("")):
+    """A Validation Specialist defines an allow-listed validation scenario. Evaluated on the next run; nothing is executed as code."""
+    user = get_current_user(request)
+    migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+
+    def num(text: str):
+        t = text.strip()
+        return None if not t else (int(t) if re.fullmatch(r"-?\d+", t) else float(t))
+    try:
+        params: Dict[str, Any] = {}
+        if check_type == "ALLOWED_VALUES":
+            params["values"] = [v for v in re.split(r"[,\n]+", values) if v.strip()]
+        elif check_type == "MAX_LENGTH":
+            params["max"] = num(max_value)
+        elif check_type == "ROW_COUNT_MIN":
+            params["min"] = num(min_value)
+        elif check_type == "NUMERIC_RANGE":
+            params["min"], params["max"] = num(min_value), num(max_value)
+        elif check_type == "DATE_PARSEABLE":
+            params["input_formats"] = [f.strip() for f in formats.split(",") if f.strip()]
+        conn = get_db_connection()
+        try:
+            created = validation_scenarios.create_scenario(conn, migration_id, entity_name, check_type, field_name, params, stage, description, user["name"])
+            conn.commit()
+        finally:
+            conn.close()
+    except ValueError as exc:
+        return _scenario_redirect("error", str(exc))
+    _target_setup_audit("VALIDATION_SCENARIO_DEFINED", user, {"scenario_id": created["scenario_id"], "check_type": check_type, "entity": entity_name, "stage": stage})
+    return _scenario_redirect("notice", f"Scenario {created['scenario_id']} saved. It runs with the next validation run.")
+
+
+def _adf_status(conn, migration_id: str):
+    """Latest stored ADF package with the reasons (if any) it is stale; None when no package was saved."""
+    stored = artifact_store.list_artifacts(conn, migration_id, "ADF_PACKAGE")
+    if not stored:
+        return None
+    spec = target_connector.spec(conn)
+    approved = [m for m in target_mapping.list_mappings(conn, migration_id, spec) if m["status"] == "APPROVED"]
+    return {"latest": stored[0], "stale_reasons": artifact_store.staleness(stored[0], artifact_store.build_provenance(conn, migration_id, spec, approved))}
+
+
+MIN_STALE_REASON = 10
+
+
+def _stale_gate(conn, migration_id: str, reason: str):
+    """Sign-off evidence may not be saved while the latest ADF package is stale unless the reviewer states why.
+    Returns (error_message_or_None, override_record_or_None)."""
+    status = _adf_status(conn, migration_id)
+    if not status or not status["stale_reasons"]:
+        return None, None
+    reason = " ".join(str(reason or "").split())
+    if len(reason) < MIN_STALE_REASON:
+        return ("The latest ADF package " + status["latest"]["artifact_id"] + " is stale: " + " ".join(status["stale_reasons"]) +
+                " Generate a new package, or give a reason (at least 10 characters) for signing off against it."), None
+    return None, {"package_artifact_id": status["latest"]["artifact_id"], "package_version": status["latest"]["artifact_version"],
+                  "stale_reasons": status["stale_reasons"], "reviewer_reason": reason[:500]}
+
+
+def _adf_reference(conn, migration_id: str, run_id: str):
+    spec = target_connector.spec(conn)
+    approved = [m for m in target_mapping.list_mappings(conn, migration_id, spec) if m["status"] == "APPROVED"]
+    return artifact_store.package_reference(conn, migration_id, artifact_store.build_provenance(conn, migration_id, spec, approved), run_id)
+
+
+@app.get("/api/validation/signoff-evidence")
+async def download_signoff_evidence(request: Request):
+    """Download the validation sign-off evidence for the latest validation run (counts, ids and reasons only)."""
+    user = get_current_user(request)
+    migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    conn = get_db_connection()
+    try:
+        try:
+            approved = [dict(r) for r in conn.execute("SELECT entity_name, source_field, canonical_field FROM canonical_mappings WHERE migration_id = ? AND is_confirmed = 1", (migration_id,)).fetchall()]
+            blocked, override = _stale_gate(conn, migration_id, request.query_params.get("stale_reason", ""))
+            if blocked:
+                return _scenario_redirect("error", blocked)
+            doc = signoff_evidence.build(conn, migration_id, user["name"], drift_detection.detect(approved, state_store.entity_source_files))
+            doc["adf_package"] = _adf_reference(conn, migration_id, doc["validation_run"]["run_id"])
+            if override:
+                doc["stale_package_override"] = {**override, "reviewer": user["name"]}
+        except ValueError as exc:
+            return _scenario_redirect("error", str(exc))
+        conn.commit()
+    finally:
+        conn.close()
+    _target_setup_audit("SIGNOFF_EVIDENCE_EXPORTED", user, {"run_id": doc["validation_run"]["run_id"]})
+    return Response(content=json.dumps(doc, indent=2, default=str), media_type="application/json",
+                    headers={"Content-Disposition": f'attachment; filename="signoff_evidence_{migration_id}.json"'})
+
+
+@app.post("/api/validation/scenarios/suggest")
+async def suggest_validation_scenarios(request: Request):
+    """Draft default scenarios from the confirmed target contract. They stay DRAFT until a Validation Specialist adopts each one."""
+    user = get_current_user(request)
+    migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    conn = get_db_connection()
+    try:
+        spec = target_connector.spec(conn)
+        if not spec:
+            return _scenario_redirect("error", "Confirm the target system first; suggestions come from the target contract.")
+        maps = target_mapping.list_mappings(conn, migration_id, spec)
+        found = validation_scenarios.suggest_defaults(spec, maps, validation_scenarios.list_scenarios(conn, migration_id))
+        count = validation_scenarios.save_suggestions(conn, migration_id, found, user["name"])
+        conn.commit()
+    finally:
+        conn.close()
+    _target_setup_audit("VALIDATION_SCENARIOS_SUGGESTED", user, {"count": count})
+    return _scenario_redirect("notice", f"{count} suggested scenario(s) added as drafts. Adopt the ones you want; drafts are not evaluated." if count else "No new suggestions: approved required fields and keys are already covered.")
+
+
+@app.post("/api/validation/scenarios/{scenario_id}/adopt")
+async def adopt_validation_scenario(request: Request, scenario_id: str):
+    user = get_current_user(request)
+    conn = get_db_connection()
+    try:
+        try:
+            validation_scenarios.adopt_scenario(conn, scenario_id)
+        except ValueError as exc:
+            return _scenario_redirect("error", str(exc))
+        conn.commit()
+    finally:
+        conn.close()
+    _target_setup_audit("VALIDATION_SCENARIO_ADOPTED", user, {"scenario_id": scenario_id})
+    return _scenario_redirect("notice", f"Scenario {scenario_id} adopted. It runs with the next validation run.")
+
+
+@app.post("/api/validation/scenarios/{scenario_id}/retire")
+async def retire_validation_scenario(request: Request, scenario_id: str):
+    user = get_current_user(request)
+    conn = get_db_connection()
+    try:
+        try:
+            validation_scenarios.retire_scenario(conn, scenario_id)
+        except ValueError as exc:
+            return _scenario_redirect("error", str(exc))
+        conn.commit()
+    finally:
+        conn.close()
+    _target_setup_audit("VALIDATION_SCENARIO_RETIRED", user, {"scenario_id": scenario_id})
+    return _scenario_redirect("notice", f"Scenario {scenario_id} retired.")
+
+
+@app.post("/api/validation/exceptions")
+async def propose_validation_exception(request: Request, run_id: str = Form(...), check_ref: str = Form(...), reason: str = Form("")):
+    """A Validation Specialist proposes accepting a finding; a Migration Analyst or Platform Admin decides."""
+    user = get_current_user(request)
+    migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    conn = get_db_connection()
+    try:
+        try:
+            run = conn.execute("SELECT results_json FROM validation_runs WHERE run_id = ? AND migration_id = ?", (run_id, migration_id)).fetchone()
+            if not run or not any(c.get("ref") == check_ref and c["status"] in ("FAIL", "WARN", "NOT_EVALUATED") for c in json.loads(run["results_json"])["checks"]):
+                raise ValueError("That finding does not exist in the run, or it passed.")
+            eid = validation_scenarios.propose_exception(conn, migration_id, run_id, check_ref, reason, user["name"])
+        except ValueError as exc:
+            return _validation_redirect("error", str(exc))
+        conn.commit()
+    finally:
+        conn.close()
+    _target_setup_audit("VALIDATION_EXCEPTION_PROPOSED", user, {"exception_id": eid, "run_id": run_id, "check_ref": check_ref})
+    return _validation_redirect("notice", f"Exception {eid} proposed. A Migration Analyst or Platform Admin must decide it.")
+
+
+@app.post("/api/validation/exceptions/{exception_id}/decision")
+async def decide_validation_exception(request: Request, exception_id: str, decision: str = Form(...), comments: str = Form("")):
+    user = get_current_user(request)
+    conn = get_db_connection()
+    try:
+        try:
+            row = validation_scenarios.decide_exception(conn, exception_id, decision.upper(), user["name"], comments)
+        except ValueError as exc:
+            return _validation_redirect("error", str(exc))
+        conn.commit()
+    finally:
+        conn.close()
+    _target_setup_audit("VALIDATION_EXCEPTION_" + row["status"], user, {"exception_id": exception_id, "check_ref": row["check_ref"]})
+    return _validation_redirect("notice", f"Exception {exception_id} {row['status'].lower()}.")
+
+
+@app.post("/api/validation/run")
+async def run_validation(request: Request):
+    """Execute deterministic source-to-canonical checks on approved mappings and confirmed files."""
+    user = get_current_user(request)
+    migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    try:
+        cfg = load_firm_config()
+    except FirmConfigError as exc:
+        raise HTTPException(status_code=409, detail=f"Firm configuration is required before validation. {exc}")
+    contract = {
+        e: {"required": cfg.required_fields(e), "keys": [f.name for f in cfg.entities[e].fields if f.is_key]}
+        for e in migration_validation.ENTITIES if e in cfg.entities}
+    conn = get_db_connection()
+    try:
+        mappings: Dict[str, Dict[str, str]] = {}
+        for row in conn.execute(
+                "SELECT entity_name, source_field, canonical_field FROM canonical_mappings WHERE migration_id = ? AND is_confirmed = 1",
+                (migration_id,)).fetchall():
+            mappings.setdefault(row["entity_name"], {})[row["source_field"]] = row["canonical_field"]
+        scenarios = validation_scenarios.list_scenarios(conn, migration_id, active_only=True)
+        conn.commit()
+    finally:
+        conn.close()
+    if not mappings:
+        return RedirectResponse(url="/reconciliation?error=" + quote_plus("Approve at least one mapping before running validation."),
+                                status_code=status.HTTP_303_SEE_OTHER)
+    files: Dict[str, List[Dict[str, Any]]] = {}
+    for entity, group in state_store.entity_source_files.items():
+        for rec in group.values():
+            if rec.get("inference_approval_status") != "APPROVED" or entity not in migration_validation.ENTITIES:
+                continue
+            stored = rec.get("stored_path")
+            if not stored or not file_store.is_file(stored):
+                continue
+            try:
+                records = read_source_records(rec.get("filename", "source.csv"), file_store.read_bytes(stored))
+            except (OSError, ValueError):
+                continue
+            files.setdefault(entity, []).append({"filename": rec.get("filename", "source"), "records": records})
+    results = migration_validation.run_checks(contract, mappings, files, scenarios)
+    run_id = "VAL-" + uuid.uuid4().hex[:10].upper()
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            "INSERT INTO validation_runs (run_id, migration_id, status, results_json, executed_by, executed_utc) VALUES (?, ?, ?, ?, ?, ?)",
+            (run_id, migration_id, results["status"], json.dumps(results), user["name"], now))
+        conn.commit()
+    finally:
+        conn.close()
+    state_store.audit_log.append({
+        "event": "VALIDATION_RUN_EXECUTED", "actor": user["name"], "timestamp_utc": now,
+        "details": {"run_id": run_id, "status": results["status"], "summary": results["summary"]},
+    })
+    return RedirectResponse(url="/reconciliation#validation-results", status_code=status.HTTP_303_SEE_OTHER)
+
+
+# --- PHASE 1 PILOT ENDPOINTS: SOURCE-TO-CANONICAL ACCOUNT ---
+
+@app.post("/api/pilot/account/profile")
+async def profile_pilot_account_file(file: UploadFile = File(...)):
+    """Inspects uploaded accounts.csv, infers types, null rates, and candidate keys."""
+    content = await file.read()
+    profile = SourceDataProfiler.profile_csv_content(file.filename, content, entity_name="Account")
+    if profile.get("status") != "PROFILED":
+        raise HTTPException(status_code=400, detail=profile.get("error_message", "CSV profiling failed."))
+    run_id = f"RUN-{uuid.uuid4().hex}"
+    profile_id = state_store.persist_source_profile(profile, run_id=run_id)
+    profile["run_id"] = run_id
+    profile["profile_id"] = profile_id
+    return JSONResponse({"status": "SUCCESS", "profile": profile})
+
+
+@app.post("/api/pilot/account/map")
+async def map_pilot_account(records: Optional[List[Dict[str, Any]]] = None):
+    """Executes source-to-canonical mapping with confidence scoring and persists metadata lineage."""
+    if records is None:
+        records = []
+
+    mapping_res = schema_mapper.map_source_to_canonical("Account", records)
+    run_id = f"RUN-{uuid.uuid4().hex}"
+    state_store.persist_mapping_lineage(mapping_res, run_id=run_id, actor="Platform Admin")
+    safe_mapping = _preview_only_mapping(mapping_res)
+    return JSONResponse({"status": mapping_res.get("status", "UNKNOWN"), "run_id": run_id, "mapping": safe_mapping})
+
+
+@app.get("/api/pilot/account/lineage")
+async def get_pilot_account_lineage():
+    """Retrieves SQLite metadata lineage audit records for the Account pilot."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM field_lineage_audit WHERE entity_name = 'Account' ORDER BY timestamp_utc DESC LIMIT 20;")
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return JSONResponse({"status": "SUCCESS", "lineage_records": rows})
+
+
+# --- PHASE 2 & 3: MIGRATION TELEMETRY & LINEAGE ENDPOINTS ---
+
+@app.get("/api/migration/telemetry")
+async def get_migration_telemetry_report():
+    """Returns migration-level and entity-level mapping confidence, gap counts, and readiness."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT entity_name, source_record_count, mapped_record_count, confidence_score, status, executed_utc
+        FROM migration_runs ORDER BY executed_utc DESC;
+    """)
+    run_rows = [dict(r) for r in cursor.fetchall()]
+
+    cursor.execute("""
+        SELECT entity_name, source_column, canonical_column, applied_rule, validation_status
+        FROM field_lineage_audit ORDER BY timestamp_utc DESC;
+    """)
+    lineage_rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+
+    total_entities = len(run_rows)
+    avg_confidence = round(sum(r["confidence_score"] for r in run_rows) / total_entities, 2) if total_entities > 0 else 1.0
+
+    return JSONResponse({
+        "status": "SUCCESS",
+        "migration_id": state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"),
+        "overall_confidence_score": avg_confidence,
+        "entity_runs": run_rows,
+        "lineage_audit": lineage_rows[:20]
+    })
+
+
+@app.get("/api/waves/conditions")
+async def get_wave_cohort_conditions():
+    """Returns declarative conditions catalog used for condition-driven cohort actuation."""
+    return JSONResponse({
+        "status": "SUCCESS",
+        "conditions": CohortConditionEngine.get_condition_catalog()
+    })
+
+@app.post("/api/waves/evaluate-record")
+async def evaluate_record_cohort():
+    """Wave evaluation is intentionally deferred until approved ADLS telemetry is available."""
+    return JSONResponse(
+        {
+            "status": "DEFERRED_SCOPE",
+            "wave_assignment": "DISABLED",
+            "message": "Conditions can be configured in this phase, but records are not evaluated and no waves are assigned.",
+        },
+        status_code=409,
+    )
+
+
+# --- ADLS & AZURE DATA FACTORY (ADF) ENDPOINTS ---
+
+@app.get("/api/adls/status")
+async def get_adls_status():
+    """Returns Azure Data Lake Storage Gen2 connection status."""
+    return {
+        "status": "CONNECTED" if state_store.adls_connected else "DISCONNECTED",
+        "account_name": os.getenv("AZURE_STORAGE_ACCOUNT", "stgcorecapdata"),
+        "container": state_store.adls_container,
+        "hybrid_mode": "ACTIVE"
+    }
+
+
+@app.post("/api/adls/upload")
+async def upload_to_adls_container(run_id: str = Form("RUN-001"), subfolder: str = Form("RAW"), file: UploadFile = File(...)):
+    """Uploads source extracts directly to ADLS Gen2 container and local fallback storage."""
+    content = await file.read()
+    rel_path, sha256_hash, size_bytes = HybridStorageManager.save_file(
+        run_id=run_id,
+        filename=file.filename,
+        content=content,
+        subfolder=subfolder,
+        adls_container=state_store.adls_container
+    )
+    return JSONResponse({
+        "status": "SUCCESS",
+        "file_name": file.filename,
+        "relative_path": rel_path,
+        "sha256": sha256_hash,
+        "size_bytes": size_bytes,
+        "adls_container": state_store.adls_container
+    })
+
+
+@app.post("/api/adf/trigger")
+async def trigger_adf_pipeline():
+    """Actual target-side ADF execution is deferred; P0 is source-to-canonical mapping only."""
+    return JSONResponse(
+        {
+            "status": "DEFERRED_SCOPE",
+            "mode": "NOT_SUBMITTED",
+            "message": "Target-side ADF execution is disabled in P0. Generate and review deployment artifacts separately.",
+        },
+        status_code=409,
+    )
+
+
+@app.get("/api/adf/status/{adf_run_id}")
+async def check_adf_pipeline_status(adf_run_id: str):
+    """Queries Azure Data Factory pipeline execution status."""
+    status_res = adf_client.get_pipeline_run_status(adf_run_id)
+    return JSONResponse(status_res)
+
+
+@app.get("/api/runs/{run_id}/export-package")
+async def export_package(run_id: str, mode: str = "local"):
+    """Generates SQL views and exports ADF deployment package to ADLS or local storage."""
+    in_scope_list = [e["entity_name"] for e in state_store.get_in_scope_entities()]
+    manifest = ADFPackageExporter.export_package(
+        run_id=run_id,
+        migration_id=state_store.questionnaire_data.get("migration_id", "MIG-CORECAP-2026"),
+        in_scope_entities=in_scope_list,
+        adls_container=state_store.adls_container
+    )
+    return JSONResponse(manifest)
+
+
+@app.get("/api/adf/package/download/{run_id}")
+async def download_adf_package_file(run_id: str):
+    """Downloads the exported ADF package as a deployable zip bundle."""
+    zip_path = Path(f"App_Data/Storage/{run_id}/TRANSFORMED/adf_package_{run_id}.zip")
+    if not zip_path.exists():
+        in_scope_list = [e["entity_name"] for e in state_store.get_in_scope_entities()]
+        ADFPackageExporter.export_package(
+            run_id=run_id,
+            migration_id=state_store.questionnaire_data.get("migration_id", "MIG-CORECAP-2026"),
+            in_scope_entities=in_scope_list,
+            adls_container=state_store.adls_container
+        )
+    if zip_path.exists():
+        return FileResponse(
+            path=str(zip_path),
+            filename=f"adf_package_{run_id}.zip",
+            media_type="application/zip"
+        )
+    raise HTTPException(status_code=404, detail="ADF package bundle not found.")
+
+
+# --- FORM SUBMISSIONS & API ENDPOINTS ---
+
+@app.post("/api/kernel/update")
+async def update_kernel_config(
+    request: Request,
+    sleeve_invariant: str = Form(...),
+    sleeve_tolerance: str = Form(...),
+    aum_drift_gate: str = Form(...)
+):
+    user = get_current_user(request)
+    if user["role"] not in CANONICAL_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Kernel Configuration edits are strictly restricted to Platform Admin or the Domain SME (canonical model owner)."
+        )
+
+    state_store.update_kernel_specs(user["name"], sleeve_invariant, sleeve_tolerance, aum_drift_gate)
+    logger.info(f"Wealth Kernel specifications updated by {user['name']} ({user['role']})")
+    return RedirectResponse(url="/firm-knowledge", status_code=status.HTTP_303_SEE_OTHER)
+
+
+CHANGE_TYPES = {
+    "ADD_FIELD": "Add a canonical field",
+    "CHANGE_DEFINITION": "Change a field definition or rule",
+    "ADD_REFERENCE_VALUE": "Add or change a reference/lookup value",
+    "OTHER": "Other canonical model change",
+}
+CHANGE_ENTITIES = ("Account", "Household", "Client")
+CHANGE_DECISIONS = {"APPROVED", "REJECTED", "DEFERRED"}
+
+
+# ---------------------------------------------------------------------------
+# Canonical-to-target mapping (forward only, demo target spec, no target loading)
+# ---------------------------------------------------------------------------
+def _typed_rule_ok(expression: str) -> bool:
+    """A rule a reviewer picked or typed must be exactly a built-in transformation or an APPROVED pinned rule version.
+    Free text is never executed: anything else has to be authored and approved on the Transformation Rules page."""
+    expr = str(expression or "").strip().upper()
+    if transformation_rules.parse_expression(expr):
+        return transformation_rules.approved_rule_for_expression(expr) is not None
+    return expr in SchemaMapperAgent.SUPPORTED_APPROVED_TRANSFORMS
+
+
+_RULE_NOT_REGISTERED = ("'{rule}' is not a registered transformation. Pick one from the list, or author and approve it first on the "
+                        "Transformation Rules page; typed text is never executed.")
+
+
+def _canonical_field_lists() -> Dict[str, List[str]]:
+    try:
+        cfg = load_firm_config()
+    except FirmConfigError:
+        return {}
+    return {e: cfg.canonical_field_names(e) + canonical_overlay.active_added_fields(e)
+            for e in target_mapping.ENTITIES if e in cfg.entities}
+
+
+def _canonical_types() -> Dict[str, Dict[str, str]]:
+    """{entity: {field: type}} for inference; fields added by approved change requests have no declared type."""
+    try:
+        cfg = load_firm_config()
+    except FirmConfigError:
+        return {}
+    out: Dict[str, Dict[str, str]] = {}
+    for e in target_mapping.ENTITIES:
+        if e in cfg.entities:
+            out[e] = {f.name: f.type for f in cfg.entities[e].fields}
+            out[e].update({n: "" for n in canonical_overlay.active_added_fields(e)})  # type unknown until defined
+    return out
+
+
+def _target_mapping_context(request: Request, user: Dict[str, str], preview_result=None, notice: str = "", error: str = "") -> Dict[str, Any]:
+    migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    conn = get_db_connection()
+    try:
+        cfg = target_connector.get_config(conn)
+        spec = target_connector.spec(conn)
+        mappings = target_mapping.list_mappings(conn, migration_id, spec)
+        approved_src = conn.execute(
+            "SELECT COUNT(*) FROM canonical_mappings WHERE migration_id = ? AND is_confirmed = 1", (migration_id,)).fetchone()[0]
+        packages = package_contract.list_packages(conn, migration_id)
+        stored_adf = artifact_store.list_artifacts(conn, migration_id, "ADF_PACKAGE")
+        adf_status = _adf_status(conn, migration_id)
+        ccr = {(r["entity_name"], r["canonical_field"]): r for r in conn.execute(
+            "SELECT entity_name, canonical_field, request_id, status FROM canonical_change_requests WHERE migration_id = ? "
+            "AND change_type = 'ADD_FIELD' AND status != 'REJECTED' ORDER BY created_utc", (migration_id,)).fetchall()}
+        conn.commit()
+    finally:
+        conn.close()
+    gaps = target_mapping.gap_report(spec, _canonical_field_lists()) if spec else {"missing": [], "unused": [], "code_lists": []}
+    for g in gaps["missing"]:
+        existing = ccr.get((g["entity"], g["suggested_canonical_field"]))
+        g["change_request"] = dict(existing) if existing else None
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for m in mappings:
+        grouped.setdefault(m["entity_name"], []).append(m)
+    inferred = None
+    if cfg and cfg.get("model"):
+        inferred = target_inference.to_spec(cfg["model"], "INFERRED_CONFIRMED" if target_connector.is_confirmed(cfg) else "INFERRED_PENDING", include_rejected=True)
+    return {
+        "page_title": "Target system & mapping", "user_name": user["name"], "user_role": user["role"],
+        "spec": spec, "target_config": cfg, "inferred": inferred, "gaps": gaps,
+        "can_raise_change": user["role"] in CHANGE_REQUEST_ROLES, "grouped": grouped, "has_mappings": bool(mappings), "approved_source_mappings": approved_src,
+        "approved_rules": transformation_rules.approved_rules(), "builtin_rules": sorted(SchemaMapperAgent.SUPPORTED_APPROVED_TRANSFORMS), "preview": preview_result, "coverage": target_mapping.coverage(spec, mappings), "packages": packages, "stored_adf": stored_adf, "adf_status": adf_status,
+        "can_propose": user["role"] in DISCOVERY_ROLES, "can_setup_target": user["role"] in PLATFORM_ROLES, "can_review": user["role"] in APPROVAL_ROLES,
+        "can_preview": user["role"] in TARGET_PREVIEW_ROLES, "notice": notice, "error": error,
+        "default_endpoint": os.environ.get("SIMULATED_TARGET_URL", "http://127.0.0.1:8100"),
+        "canonical_fields": {e: sorted(fs) for e, fs in _canonical_types().items()},
+        "pending_reviews": target_connector.pending_reviews(cfg["model"]) if cfg and cfg.get("model") else 0,
+    }
+
+
+def _target_redirect(key: str, message: str):
+    return RedirectResponse(url=f"/target-mapping?{key}=" + quote_plus(message), status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.get("/target-mapping", response_class=HTMLResponse)
+async def target_mapping_page(request: Request, notice: str = "", error: str = ""):
+    user = get_current_user(request)
+    return render_template_with_context(request, "target_mapping.html", _target_mapping_context(request, user, notice=notice, error=error))
+
+
+@app.get("/target-setup")
+async def target_setup_redirect(request: Request):
+    """Target system and mapping are one page; keep the old address working."""
+    get_current_user(request)
+    return RedirectResponse(url="/target-mapping#target-system", status_code=status.HTTP_303_SEE_OTHER)
+
+
+def _target_setup_audit(event: str, user: Dict[str, str], details: Dict[str, Any]) -> None:
+    state_store.audit_log.append({"event": event, "actor": user["name"], "timestamp_utc": datetime.now(timezone.utc).isoformat(), "details": details})
+
+
+@app.post("/api/target-system/configure")
+async def configure_target_system(request: Request, target_name: str = Form(...), endpoint: str = Form(...),
+                                  scope_tables: str = Form(""), include_code_lists: str = Form(""), owner: str = Form("")):
+    """One-time setup, step 1: save the connection configuration and test the connection."""
+    user = get_current_user(request)
+    conn = get_db_connection()
+    try:
+        try:
+            cfg = target_connector.configure(conn, user["name"], target_name, endpoint, [t for t in re.split(r"[,\s]+", scope_tables) if t],
+                                             include_code_lists == "on", owner)
+        except ValueError as exc:
+            return _target_redirect("error", str(exc))
+        conn.commit()
+    finally:
+        conn.close()
+    _target_setup_audit("TARGET_SYSTEM_CONFIGURED", user, {"endpoint": cfg["endpoint"], "status": cfg["status"]})
+    if cfg["status"] != "CONNECTED":
+        return _target_redirect("error", cfg["connection_detail"])
+    return _target_redirect("notice", cfg["connection_detail"] + " Next: infer the target system.")
+
+
+@app.post("/api/target-system/infer")
+async def infer_target_system(request: Request):
+    """One-time setup, step 2: read the target's schema and infer entities and fields (a proposal, not a decision)."""
+    user = get_current_user(request)
+    canonical_types = _canonical_types()
+    conn = get_db_connection()
+    try:
+        try:
+            cfg = target_connector.infer_model(conn, canonical_types)
+        except Exception as exc:
+            return _target_redirect("error", f"Could not infer the target system: {exc}")
+        conn.commit()
+    finally:
+        conn.close()
+    n = sum(len(b["fields"]) for b in cfg["model"]["entities"].values())
+    _target_setup_audit("TARGET_SYSTEM_INFERRED", user, {"schema_hash": cfg["schema_hash"], "fields": n})
+    return _target_redirect("notice", f"Inferred {len(cfg['model']['entities'])} entities and {n} target fields. Review them, then confirm.")
+
+
+@app.post("/api/target-system/confirm")
+async def confirm_target_system(request: Request):
+    """One-time setup, step 3: a Platform Admin confirms the inferred model. Locks the setup."""
+    user = get_current_user(request)
+    conn = get_db_connection()
+    try:
+        try:
+            cfg = target_connector.confirm(conn, user["name"])
+        except ValueError as exc:
+            return _target_redirect("error", str(exc))
+        conn.commit()
+    finally:
+        conn.close()
+    _target_setup_audit("TARGET_SYSTEM_CONFIRMED", user, {"schema_hash": cfg["schema_hash"]})
+    return _target_redirect("notice", "Target system confirmed. Setup is complete and locked; mapping can start.")
+
+
+@app.post("/api/target-system/review-field")
+async def review_target_field(request: Request, table: str = Form(...), column: str = Form(...), decision: str = Form(...),
+                              canonical_field: str = Form("")):
+    """Setup review: mark one inferred target field correct, change its canonical field, or reject it."""
+    user = get_current_user(request)
+    conn = get_db_connection()
+    try:
+        try:
+            target_connector.review_field(conn, user["name"], table, column, decision, canonical_field, _canonical_types())
+        except ValueError as exc:
+            return _target_redirect("error", str(exc))
+        conn.commit()
+    finally:
+        conn.close()
+    _target_setup_audit("TARGET_FIELD_REVIEWED", user, {"field": f"{table}.{column}", "decision": decision.upper(), "canonical_field": canonical_field.strip().upper()})
+    return _target_redirect("notice", f"{table}.{column}: decision recorded.")
+
+
+@app.post("/api/target-system/review-all")
+async def review_all_target_fields(request: Request):
+    """Setup review: accept every still-undecided inferred field as inferred."""
+    user = get_current_user(request)
+    conn = get_db_connection()
+    try:
+        try:
+            target_connector.review_all(conn, user["name"])
+        except ValueError as exc:
+            return _target_redirect("error", str(exc))
+        conn.commit()
+    finally:
+        conn.close()
+    _target_setup_audit("TARGET_FIELDS_ACCEPTED", user, {})
+    return _target_redirect("notice", "Remaining inferred fields accepted as inferred.")
+
+
+@app.post("/api/target-system/move-table")
+async def move_target_table(request: Request, table: str = Form(...), entity: str = Form("")):
+    """Setup review: put a target table under another entity, or exclude it (blank entity)."""
+    user = get_current_user(request)
+    conn = get_db_connection()
+    try:
+        try:
+            target_connector.move_table(conn, user["name"], table, entity.strip() or None, _canonical_types())
+        except ValueError as exc:
+            return _target_redirect("error", str(exc))
+        conn.commit()
+    finally:
+        conn.close()
+    _target_setup_audit("TARGET_TABLE_REASSIGNED", user, {"table": table, "entity": entity.strip() or "EXCLUDED"})
+    return _target_redirect("notice", f"{table}: moved to {entity.strip() or 'excluded'}. Review its fields again.")
+
+
+@app.post("/api/target-system/reopen")
+async def reopen_target_system(request: Request, reason: str = Form("")):
+    """Platform Admin unlocks a confirmed target setup to reconfigure it. Audited; target mapping pauses until re-confirmed."""
+    user = get_current_user(request)
+    conn = get_db_connection()
+    try:
+        try:
+            target_connector.reopen(conn, user["name"], reason)
+        except ValueError as exc:
+            return _target_redirect("error", str(exc))
+        conn.commit()
+    finally:
+        conn.close()
+    _target_setup_audit("TARGET_SYSTEM_REOPENED", user, {"reason": reason.strip()[:200]})
+    return _target_redirect("notice", "Target setup reopened. Change the configuration, infer and confirm again; target mapping is paused until then.")
+
+
+@app.post("/api/target-mapping/gaps/raise")
+async def raise_gap_change_requests(request: Request, entity_name: str = Form(...), target_field: str = Form(...)):
+    """Turn a target-vs-canonical gap into an ordinary canonical change request for the Domain SME to decide.
+
+    The field name and definition come from the server-side gap report, never from the form.
+    target_field '*' raises every required gap that has no open request.
+    """
+    user = get_current_user(request)
+    migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    conn0 = get_db_connection()
+    try:
+        spec0 = target_connector.spec(conn0)
+    finally:
+        conn0.close()
+    if not spec0:
+        return _target_redirect("error", "Confirm the target system setup first.")
+    gaps = [g for g in target_mapping.gap_report(spec0, _canonical_field_lists())["missing"]
+            if g["entity"] == entity_name.strip() and (target_field == "*" and g["required"] or g["target_field"] == target_field)]
+    if not gaps:
+        return _target_redirect("error", "No matching gap: the canonical model already covers it.")
+    raised: List[str] = []
+    conn = get_db_connection()
+    try:
+        for g in gaps:
+            field = g["suggested_canonical_field"]
+            exists = conn.execute(
+                "SELECT 1 FROM canonical_change_requests WHERE migration_id = ? AND entity_name = ? AND canonical_field = ? "
+                "AND change_type = 'ADD_FIELD' AND status != 'REJECTED'", (migration_id, g["entity"], field)).fetchone()
+            if exists:
+                continue
+            request_id = "CCR-" + uuid.uuid4().hex[:10].upper()
+            conn.execute(
+                "INSERT INTO canonical_change_requests (request_id, migration_id, entity_name, canonical_field, change_type, "
+                "proposed_change, reason, status, requested_by, created_utc) VALUES (?, ?, ?, ?, 'ADD_FIELD', ?, ?, 'OPEN', ?, ?)",
+                (request_id, migration_id, g["entity"], field,
+                 f"Add optional canonical field {field} ({g['type']}) to {g['entity']}.",
+                 f"Target gap: Simplicity requires {g['target_field']}{' (required)' if g['required'] else ''} and the canonical model has no source field.",
+                 user["name"], datetime.now(timezone.utc).isoformat()))
+            raised.append(request_id)
+            state_store.audit_log.append({"event": "CANONICAL_CHANGE_REQUESTED", "actor": user["name"],
+                                          "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                                          "details": {"request_id": request_id, "entity": g["entity"], "field": field, "source": "TARGET_GAP"}})
+        conn.commit()
+    finally:
+        conn.close()
+    if not raised:
+        return _target_redirect("error", "A change request already exists for that gap.")
+    return _target_redirect("notice", f"{len(raised)} canonical change request(s) raised ({', '.join(raised)}). The Domain SME approves and applies them; then regenerate target proposals.")
+
+
+@app.post("/api/target-mapping/propose")
+async def propose_target_mappings(request: Request):
+    user = get_current_user(request)
+    migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    conn = get_db_connection()
+    try:
+        spec = target_connector.spec(conn)
+        if spec is None:
+            return _target_redirect("error", "Complete and confirm the one-time target system setup first.")
+        unresolved_before = sum(1 for m in target_mapping.list_mappings(conn, migration_id, spec) if not m["canonical_field"])
+        try:
+            created = target_mapping.propose(conn, migration_id, _canonical_field_lists(), spec)
+        except ValueError as exc:
+            return _target_redirect("error", str(exc))
+        unresolved_after = sum(1 for m in target_mapping.list_mappings(conn, migration_id, spec) if not m["canonical_field"])
+        resolved = max(0, unresolved_before - unresolved_after)
+        conn.commit()
+    finally:
+        conn.close()
+    state_store.audit_log.append({"event": "TARGET_MAPPINGS_PROPOSED", "actor": user["name"],
+                                  "timestamp_utc": datetime.now(timezone.utc).isoformat(), "details": {"created": created, "resolved": resolved}})
+    parts = []
+    if created:
+        parts.append(f"{created} target mapping proposal(s) created")
+    if resolved:
+        parts.append(f"{resolved} unresolved field(s) now have a canonical source")
+    if parts:
+        return _target_redirect("notice", "; ".join(parts) + ". Each needs human approval.")
+    return _target_redirect("notice", "Nothing to refresh: every target field already has a proposal and a canonical source.")
+
+
+@app.post("/api/packages/generate")
+async def generate_deployment_package(request: Request):
+    """Generate a versioned, schema-validated deployment package (DRAFT contract) from approved configuration only."""
+    user = get_current_user(request)
+    migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    setup = state_store.questionnaire_data.get("migration_setup", {})
+    try:
+        cfg_firm = load_firm_config()
+    except FirmConfigError as exc:
+        return _target_redirect("error", f"Firm configuration is required: {exc}")
+    conn = get_db_connection()
+    try:
+        tcfg = target_connector.get_config(conn)
+        spec = target_connector.spec(conn)
+        if not spec or not tcfg:
+            return _target_redirect("error", "Confirm the target system before generating a deployment package.")
+        approved = [m for m in target_mapping.list_mappings(conn, migration_id, spec) if m["status"] == "APPROVED"]
+        source_maps = [{"entity": r["entity_name"], "source_field": r["source_field"], "canonical_field": r["canonical_field"],
+                        "transformation": r["transformation_expression"] or "DIRECT_COPY"} for r in conn.execute(
+            "SELECT entity_name, source_field, canonical_field, transformation_expression FROM canonical_mappings WHERE migration_id = ? AND is_confirmed = 1",
+            (migration_id,)).fetchall()]
+        rules = {r["expression"]: r for r in transformation_rules.list_rules(conn)}
+        scenarios = validation_scenarios.list_scenarios(conn, migration_id, active_only=True)
+        files = [{"filename": rec.get("filename", "source"), "entity": entity} for entity, group in state_store.entity_source_files.items()
+                 for rec in group.values() if rec.get("inference_approval_status") == "APPROVED"]
+        try:
+            body = package_contract.build_body(
+                migration_id=migration_id, source_system=str(setup.get("source_firm") or "CoreCap"), target_system=str(setup.get("target_system") or tcfg["target_name"]),
+                firm={"firm_id": cfg_firm.firm_id, "config_version": str(cfg_firm.config_version), "canonical_contract_ref": str(cfg_firm.canonical_contract_ref)},
+                target={"name": tcfg["target_name"], "model_version": str(tcfg["schema_hash"]), "confirmed_by": tcfg["confirmed_by"] or "", "confirmed_utc": tcfg["confirmed_utc"] or ""},
+                source_files=files, source_mappings=source_maps, spec=spec, approved_target=approved, rules=rules, scenarios=scenarios,
+                environment=azure_simulated.simulated_environment(migration_id))
+            result = package_contract.generate(conn, migration_id, user["name"], body)
+        except ValueError as exc:
+            return _target_redirect("error", str(exc))
+        conn.commit()
+    finally:
+        conn.close()
+    if result["new"]:
+        _target_setup_audit("DEPLOYMENT_PACKAGE_GENERATED", user, {"package_id": result["package_id"], "version": result["package_version"], "schema": package_contract.SCHEMA_VERSION})
+        return _target_redirect("notice", f"Package v{result['package_version']} ({result['package_id']}) generated against the DRAFT contract. Download it below.")
+    return _target_redirect("notice", f"Nothing changed since package v{result['package_version']} ({result['package_id']}); no new version was created.")
+
+
+@app.get("/api/packages/{package_id}/download")
+async def download_deployment_package(request: Request, package_id: str):
+    get_current_user(request)
+    conn = get_db_connection()
+    try:
+        pkg = package_contract.get_package(conn, package_id)
+        conn.commit()
+    finally:
+        conn.close()
+    if not pkg or pkg["migration_id"] != str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED")):
+        raise HTTPException(status_code=404, detail="Package not found for this migration.")
+    return Response(content=pkg["yaml_text"], media_type="application/x-yaml",
+                    headers={"Content-Disposition": f'attachment; filename="{package_id}_v{pkg["package_version"]}_package.yaml"'})
+
+
+@app.post("/api/target-mapping/adf-package")
+async def download_adf_package(request: Request):
+    """Generate the ADF package zip from approved target mappings with simulated Azure values. Nothing is deployed."""
+    user = get_current_user(request)
+    back = _validation_redirect if (await request.form()).get("return_to") == "reconciliation" else _target_redirect  # fixed allow-list, never a free URL
+    migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    conn = get_db_connection()
+    try:
+        spec = target_connector.spec(conn)
+        approved = [m for m in target_mapping.list_mappings(conn, migration_id, spec) if m["status"] == "APPROVED"]
+        conn.commit()
+    finally:
+        conn.close()
+    try:
+        rules = {}
+        for m in approved:
+            expr = m["transformation_expression"]
+            if expr != "DIRECT_COPY" and expr not in rules:
+                rules[expr] = transformation_rules.approved_rule_for_expression(expr)
+        conn = get_db_connection()
+        try:
+            provenance = artifact_store.build_provenance(conn, migration_id, spec, approved)
+        finally:
+            conn.close()
+        package = adf_package.build(migration_id, spec, approved, rules, azure_simulated.simulated_environment(migration_id), user["name"], provenance)
+    except ValueError as exc:
+        return back("error", str(exc))
+    _target_setup_audit("ADF_PACKAGE_GENERATED", user, {"migration_id": migration_id, "simulated": True, "pipeline": package["manifest"]["pipeline"],
+                                                     "entities": sorted(package["manifest"]["entities"]), "warnings": len(package["manifest"]["warnings"])})
+    conn = get_db_connection()
+    try:
+        stored = artifact_store.save(conn, migration_id, "ADF_PACKAGE", adf_package.to_zip(package), user["name"], provenance=provenance)
+        conn.commit()
+    finally:
+        conn.close()
+    _target_setup_audit("ADF_PACKAGE_STORED", user, {"artifact_id": stored["artifact_id"], "version": stored["artifact_version"], "sha256": stored["content_sha256"]})
+    return back("notice", f"ADF package v{stored['artifact_version']} saved with this migration ({stored['artifact_id']}, simulated Azure values, not deployed).")
+
+
+@app.post("/api/validation/signoff-evidence/save")
+async def save_signoff_evidence(request: Request):
+    """Save the sign-off evidence for the latest validation run with the migration's data (counts, ids and reasons only)."""
+    user = get_current_user(request)
+    migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    form = await request.form()
+    conn = get_db_connection()
+    try:
+        try:
+            approved = [dict(r) for r in conn.execute("SELECT entity_name, source_field, canonical_field FROM canonical_mappings WHERE migration_id = ? AND is_confirmed = 1", (migration_id,)).fetchall()]
+            blocked, override = _stale_gate(conn, migration_id, form.get("stale_reason", ""))
+            if blocked:
+                return _validation_redirect("error", blocked)
+            doc = signoff_evidence.build(conn, migration_id, user["name"], drift_detection.detect(approved, state_store.entity_source_files))
+            doc["adf_package"] = _adf_reference(conn, migration_id, doc["validation_run"]["run_id"])
+            if override:
+                doc["stale_package_override"] = {**override, "reviewer": user["name"]}
+        except ValueError as exc:
+            return _validation_redirect("error", str(exc))
+        stored = artifact_store.save(conn, migration_id, "SIGNOFF_EVIDENCE", json.dumps(doc, indent=2, default=str).encode("utf-8"), user["name"])
+        conn.commit()
+    finally:
+        conn.close()
+    _target_setup_audit("SIGNOFF_EVIDENCE_STORED", user, {"artifact_id": stored["artifact_id"], "version": stored["artifact_version"], "run_id": doc["validation_run"]["run_id"],
+                                                          "stale_package_override": bool(override)})
+    return _validation_redirect("notice", f"Sign-off evidence v{stored['artifact_version']} saved with this migration ({stored['artifact_id']}).")
+
+
+@app.get("/api/artifacts/{artifact_id}/download")
+async def download_stored_artifact(artifact_id: str, request: Request):
+    """Optional copy of a stored artifact; the stored file stays in the migration's data either way."""
+    get_current_user(request)
+    conn = get_db_connection()
+    try:
+        try:
+            rec = artifact_store.read(conn, artifact_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+    finally:
+        conn.close()
+    if not rec:
+        raise HTTPException(status_code=404, detail="Stored artifact not found.")
+    return Response(content=rec["data"], media_type=rec["media_type"], headers={"Content-Disposition": f'attachment; filename="{rec["filename"]}"'})
+
+
+def _canonical_rows_for_migration(migration_id: str):
+    """Canonical-shaped rows per entity, derived in memory from approved source files and mappings (files joined on the entity key)."""
+    canonical_rows: Dict[str, List[Dict[str, Any]]] = {}
+    join_info: Dict[str, Dict[str, int]] = {}
+    try:
+        key_cfg = load_firm_config()
+    except FirmConfigError:
+        key_cfg = None
+    for entity, group in state_store.entity_source_files.items():
+        if entity not in target_mapping.ENTITIES:
+            continue
+        file_rows: List[List[Dict[str, Any]]] = []
+        rules = _get_approved_mapping_rules(migration_id, entity)
+        mapper = SchemaMapperAgent(
+            custom_catalog={**schema_mapper.catalog, **{s: r["canonical_field"] for s, r in rules.items()}},
+            approved_transformations={s: r["transformation_expression"] for s, r in rules.items()})
+        for rec in group.values():
+            stored = rec.get("stored_path")
+            if rec.get("inference_approval_status") != "APPROVED" or not stored or not file_store.is_file(stored):
+                continue
+            try:
+                records = read_source_records(rec.get("filename", "source.csv"), file_store.read_bytes(stored))
+            except (OSError, ValueError):
+                continue
+            file_rows.append(mapper.map_source_to_canonical(entity, records)["mapped_records"])
+        key_field = next((f.name for f in key_cfg.entities[entity].fields if f.is_key), None) if key_cfg and entity in key_cfg.entities else None
+        joined = target_mapping.merge_by_key(file_rows, key_field)
+        canonical_rows[entity] = joined["rows"]
+        join_info[entity] = {"key": key_field, "files": len(file_rows), "keyed_rows": joined["keyed_rows"],
+                             "unkeyed_rows": joined["unkeyed_rows"], "conflicts": joined["conflicts"]}
+    return canonical_rows, join_info
+
+
+@app.post("/api/target-mapping/preview", response_class=HTMLResponse)
+async def preview_target_mapping(request: Request):
+    """Read-only dry run: canonical rows are derived in memory; only counts and findings are returned."""
+    user = get_current_user(request)
+    migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    conn = get_db_connection()
+    try:
+        spec = target_connector.spec(conn)
+        approved = [m for m in target_mapping.list_mappings(conn, migration_id, spec) if m["status"] == "APPROVED"]
+        conn.commit()
+    finally:
+        conn.close()
+    if not approved:
+        return _target_redirect("error", "Approve at least one target mapping before running a preview.")
+    canonical_rows, join_info = _canonical_rows_for_migration(migration_id)
+    result = target_mapping.preview(spec, approved, canonical_rows, join_info)
+    state_store.audit_log.append({"event": "TARGET_MAPPING_PREVIEWED", "actor": user["name"],
+                                  "timestamp_utc": datetime.now(timezone.utc).isoformat(), "details": {"migration_id": migration_id}})
+    return render_template_with_context(request, "target_mapping.html", _target_mapping_context(request, user, preview_result=result))
+
+
+@app.post("/api/target-mapping/{target_mapping_id}/review")
+async def review_target_mapping(request: Request, target_mapping_id: str, decision: str = Form(...),
+                                comments: str = Form(""), rule_override: str = Form("")):
+    user = get_current_user(request)
+    conn = get_db_connection()
+    try:
+        try:
+            row = target_mapping.review(conn, target_mapping_id, decision, user["name"], comments, rule_override)
+        except LookupError:
+            raise HTTPException(status_code=404, detail="Target mapping not found.")
+        except ValueError as exc:
+            return _target_redirect("error", str(exc))
+        conn.commit()
+    finally:
+        conn.close()
+    state_store.audit_log.append({"event": "TARGET_MAPPING_" + row["status"], "actor": user["name"],
+                                  "timestamp_utc": row["reviewed_utc"],
+                                  "details": {"entity": row["entity_name"], "target_field": row["target_field"], "canonical_field": row["canonical_field"], "rule": row["transformation_expression"]}})
+    return _target_redirect("notice", f"{row['entity_name']}.{row['target_field']} {row['status'].lower()}.")
+
+
+def _bulk_summary(done: int, failed: List[str], verb: str) -> tuple:
+    """One notice or error line for a table-style bulk review."""
+    if failed and not done:
+        return "error", "Nothing was " + verb + ". " + "; ".join(failed[:4]) + (" …" if len(failed) > 4 else "")
+    msg = f"{done} {verb}."
+    if failed:
+        msg += f" {len(failed)} not changed: " + "; ".join(failed[:4]) + (" …" if len(failed) > 4 else "")
+    return "notice", msg
+
+
+@app.post("/api/target-system/review-selected")
+async def review_selected_target_fields(request: Request):
+    """Table review of inferred target fields: every ticked row is approved as inferred, or changed when a different
+    canonical field (or none / reject) is picked on its row. The row note is kept with the decision."""
+    user = get_current_user(request)
+    form = await request.form()
+    keys = [str(k) for k in form.getlist("rows")]
+    if not keys:
+        return _target_redirect("error", "Tick at least one field to approve.")
+    common = str(form.get("common_note", "")).strip()
+    canonical = _canonical_types()
+    done, failed = 0, []
+    conn = get_db_connection()
+    try:
+        for key in keys:
+            table, _, column = key.partition("|")
+            change = str(form.get("change::" + key, "")).strip()
+            note = str(form.get("note::" + key, "")).strip() or common
+            if change == "":
+                decision, canonical_field = "correct", ""
+            elif change == "__reject__":
+                decision, canonical_field = "reject", ""
+            elif change == "__none__":
+                decision, canonical_field = "change", ""
+            else:
+                decision, canonical_field = "change", change
+            try:
+                target_connector.review_field(conn, user["name"], table, column, decision, canonical_field, canonical, note)
+                done += 1
+                _target_setup_audit("TARGET_FIELD_REVIEWED", user, {"field": f"{table}.{column}", "decision": decision.upper(),
+                                                                    "canonical_field": canonical_field.upper(), "note": note})
+            except ValueError as exc:
+                failed.append(f"{table}.{column}: {exc}")
+        conn.commit()
+    finally:
+        conn.close()
+    kind, msg = _bulk_summary(done, failed, "recorded")
+    return _target_redirect(kind, msg)
+
+
+@app.post("/api/target-mapping/review-selected")
+async def review_selected_target_mappings(request: Request):
+    """Table review of target mapping proposals: approve or reject every ticked row, with a note per row."""
+    user = get_current_user(request)
+    form = await request.form()
+    ids = [str(i) for i in form.getlist("ids")]
+    decision = str(form.get("decision", "")).strip().upper()
+    if decision not in {"APPROVED", "REJECTED"}:
+        return _target_redirect("error", "Choose approve or reject.")
+    if not ids:
+        return _target_redirect("error", "Tick at least one mapping first.")
+    common = str(form.get("common_note", "")).strip()
+    done, failed = 0, []
+    conn = get_db_connection()
+    try:
+        _tm_rows = conn.execute("SELECT target_mapping_id, entity_name, target_field FROM target_mappings").fetchall()
+        labels = {r["target_mapping_id"]: f"{r['entity_name']}.{r['target_field']}" for r in _tm_rows}
+        labels_entity = {r["target_mapping_id"]: r["entity_name"] for r in _tm_rows}
+        for tid in ids:
+            note = str(form.get("note::" + tid, "")).strip() or common
+            rule = str(form.get("rule::" + tid, "")).strip()
+            canon = str(form.get("canonical::" + tid, "")).strip()
+            try:
+                row = target_mapping.review(conn, tid, decision, user["name"], note, rule if decision == "APPROVED" else "",
+                                            canon if decision == "APPROVED" else "",
+                                            _canonical_field_lists().get(labels_entity.get(tid, ""), []))
+            except (LookupError, ValueError) as exc:
+                failed.append(f"{labels.get(tid, tid[-6:])}: {exc}")
+                continue
+            done += 1
+            state_store.audit_log.append({"event": "TARGET_MAPPING_" + row["status"], "actor": user["name"],
+                                          "timestamp_utc": row["reviewed_utc"],
+                                          "details": {"entity": row["entity_name"], "target_field": row["target_field"],
+                                                      "canonical_field": row["canonical_field"], "rule": row["transformation_expression"]}})
+        conn.commit()
+    finally:
+        conn.close()
+    kind, msg = _bulk_summary(done, failed, decision.lower())
+    return _target_redirect(kind, msg)
+
+
+@app.post("/api/target-mapping/revise-selected")
+async def revise_selected_target_mappings(request: Request):
+    """Reopen decided (approved or rejected) target mappings for a new decision. A reason is required; the earlier
+    decision stays in the history, and any saved ADF package becomes stale because the approved set changed."""
+    user = get_current_user(request)
+    form = await request.form()
+    ids = [str(i) for i in form.getlist("revise_ids")]
+    if not ids:
+        return _target_redirect("error", "Tick at least one approved or rejected mapping to reopen.")
+    common = str(form.get("common_note", "")).strip()
+    done, failed = 0, []
+    conn = get_db_connection()
+    try:
+        labels = {r["target_mapping_id"]: f"{r['entity_name']}.{r['target_field']}" for r in conn.execute(
+            "SELECT target_mapping_id, entity_name, target_field FROM target_mappings").fetchall()}
+        for tid in ids:
+            reason = str(form.get("note::" + tid, "")).strip() or common
+            try:
+                row = target_mapping.revise(conn, tid, user["name"], reason)
+            except (LookupError, ValueError) as exc:
+                failed.append(f"{labels.get(tid, tid[-6:])}: {exc}")
+                continue
+            done += 1
+            state_store.audit_log.append({"event": "TARGET_MAPPING_REOPENED", "actor": user["name"],
+                                          "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                                          "details": {"entity": row["entity_name"], "target_field": row["target_field"], "reason": reason}})
+        conn.commit()
+    finally:
+        conn.close()
+    kind, msg = _bulk_summary(done, failed, "reopened")
+    return _target_redirect(kind, msg)
+
+
+@app.post("/api/mapping-suggestions/review-selected")
+async def review_selected_source_mappings(request: Request):
+    """Table review of source-to-canonical proposals: approve or reject every ticked row, with a note per row.
+    Each row goes through the same single-item review, so validation, rules and audit trail are unchanged."""
+    user = get_current_user(request)
+    if user.get("role") not in APPROVAL_ROLES:
+        raise HTTPException(status_code=403, detail="Only Migration Analyst or Platform Admin may approve or reject mappings.")
+    form = await request.form()
+    ids = [str(i) for i in form.getlist("ids")]
+    decision = str(form.get("decision", "")).strip().upper()
+    back = "/agent-pipeline?{}=" 
+    if decision not in {"APPROVED", "REJECTED"}:
+        return RedirectResponse(url=back.format("error") + quote_plus("Choose approve or reject."), status_code=status.HTTP_303_SEE_OTHER)
+    if not ids:
+        return RedirectResponse(url=back.format("error") + quote_plus("Tick at least one mapping first."), status_code=status.HTTP_303_SEE_OTHER)
+    common = str(form.get("common_note", "")).strip()
+    done, failed = 0, []
+    conn = get_db_connection()
+    try:
+        labels = {r["suggestion_id"]: f"{r['entity_name']}.{r['source_field']}" for r in conn.execute(
+            "SELECT suggestion_id, entity_name, source_field FROM mapping_suggestions").fetchall()}
+    finally:
+        conn.close()
+    for sid in ids:
+        note = str(form.get("note::" + sid, "")).strip() or common
+        rule = str(form.get("rule::" + sid, "")).strip()
+        try:
+            await review_source_mapping_suggestion(
+                sid, decision, user["name"], note, rule if decision == "APPROVED" else "", request=None,
+                canonical_override=str(form.get("canonical::" + sid, "")).strip() if decision == "APPROVED" else "")
+            done += 1
+        except HTTPException as exc:
+            failed.append(f"{labels.get(sid, sid[-6:])}: {exc.detail}")
+    kind, msg = _bulk_summary(done, failed, decision.lower())
+    return RedirectResponse(url=back.format(kind) + quote_plus(msg), status_code=status.HTTP_303_SEE_OTHER)
+
+
+# ---------------------------------------------------------------------------
+# Transformation rules: governed, versioned, human-approved, registered types only
+# ---------------------------------------------------------------------------
+def _rules_redirect(key: str, message: str):
+    return RedirectResponse(url=f"/transformation-rules?{key}=" + quote_plus(message), status_code=status.HTTP_303_SEE_OTHER)
+
+
+def _source_columns(limit_files: int = 12) -> List[Dict[str, Any]]:
+    """Observed values per source column from the uploaded sample files (read-only; used for rule suggestions)."""
+    cols: List[Dict[str, Any]] = []
+    done = 0
+    for entity, group in state_store.entity_source_files.items():
+        for rec in group.values():
+            stored = rec.get("stored_path")
+            if done >= limit_files or rec.get("inference_approval_status") == "REJECTED" or not stored or not file_store.is_file(stored):
+                continue
+            try:
+                rows = read_source_records(rec.get("filename", "source.csv"), file_store.read_bytes(stored))
+            except (OSError, ValueError):
+                continue
+            done += 1
+            for field in (rows[0].keys() if rows else []):
+                cols.append({"entity": entity, "file": rec.get("filename", "source"), "field": str(field), "values": [r.get(field) for r in rows]})
+    return cols
+
+
+def _rule_hints(mapping_suggestions) -> Dict[str, Dict[str, Any]]:
+    """Best transformation suggestion per pending mapping row, keyed 'Entity|SOURCE_FIELD' (shown beside the rule input)."""
+    if not mapping_suggestions:
+        return {}
+    wanted = {(m["entity_name"], str(m["source_field"]).upper()) for m in mapping_suggestions}
+    hints: Dict[str, Dict[str, Any]] = {}
+    try:
+        for sg in _rule_suggestions():
+            k = (sg["entity"], str(sg["source_field"]).upper())
+            if k in wanted and f"{k[0]}|{k[1]}" not in hints:
+                hints[f"{k[0]}|{k[1]}"] = sg
+    except Exception:  # suggestions are advisory; never block the review page
+        return {}
+    return hints
+
+
+def _rule_suggestions() -> List[Dict[str, Any]]:
+    conn = get_db_connection()
+    try:
+        rules = transformation_rules.list_rules(conn)
+        conn.commit()
+    finally:
+        conn.close()
+    cross = {"custodian": SchemaMapperAgent.COMMON_CUSTODIAN_CROSSWALK, "registration": SchemaMapperAgent.REGISTRATION_TYPE_CROSSWALK,
+             "client_type": SchemaMapperAgent.CLIENT_TYPE_CROSSWALK}
+    return rule_suggestions.suggest(_source_columns(), rules, cross)
+
+
+def _rules_page(request: Request, notice: str = "", error: str = "", inferred=None, inferred_label: str = "", inferred_source=None):
+    user = get_current_user(request)
+    conn = get_db_connection()
+    try:
+        rules = transformation_rules.list_rules(conn)
+        usage = {}
+        for row in conn.execute(
+                "SELECT UPPER(transformation_expression) AS expr, COUNT(*) AS n FROM canonical_mappings "
+                "WHERE is_confirmed = 1 AND UPPER(transformation_expression) LIKE 'RULE:%' GROUP BY 1").fetchall():
+            usage[row["expr"]] = row["n"]
+        conn.commit()
+    finally:
+        conn.close()
+    for rule in rules:
+        rule["params_text"] = json.dumps(rule["params"], indent=1, sort_keys=True)
+        rule["used_by"] = usage.get(rule["expression"], 0)
+    for item in inferred or []:
+        if item.get("recognised"):
+            item["params_text"] = json.dumps(item["params"], sort_keys=True)
+    return render_template_with_context(request, "transformation_rules.html", {
+        "page_title": "Transformation Rules", "user_name": user["name"], "user_role": user["role"],
+        "rules": rules, "rule_types": transformation_rules.RULE_TYPES,
+        "builtin_rules": sorted(SchemaMapperAgent.SUPPORTED_APPROVED_TRANSFORMS),
+        "date_formats": list(transformation_rules.DATE_FORMATS),
+        "can_author": user["role"] in DISCOVERY_ROLES, "can_approve": user["role"] in APPROVAL_ROLES,
+        "rule_assets": [d for d in state_store.firm_knowledge_docs if d.get("category") in ("business_rules", "transformation_rule") and d.get("full_text")],
+        "suggestions": _rule_suggestions() if user["role"] in DISCOVERY_ROLES else [],
+        "inferred": inferred, "inferred_label": inferred_label, "inferred_source": inferred_source or {},
+        "notice": notice, "error": error,
+    })
+
+
+@app.get("/transformation-rules", response_class=HTMLResponse)
+async def transformation_rules_page(request: Request, notice: str = "", error: str = ""):
+    return _rules_page(request, notice, error)
+
+
+def _rule_text_and_label(rule_text: str, asset_id: str):
+    """Resolve pasted text or a registered asset to (text, label, error)."""
+    if asset_id:
+        doc = next((d for d in state_store.firm_knowledge_docs if d.get("id") == asset_id), None)
+        if not doc or not doc.get("full_text"):
+            return "", "", "That knowledge asset has no readable text. Register the business rules as a Markdown or text file."
+        return doc["full_text"], f"asset {doc['id']}, {doc['filename']}", ""
+    if not rule_text.strip():
+        return "", "", "Paste at least one business rule or choose a business-rules knowledge asset."
+    return rule_text, "", ""
+
+
+@app.post("/api/transformation-rules/infer-preview", response_class=HTMLResponse)
+async def preview_inferred_rules(request: Request, rule_text: str = Form(""), asset_id: str = Form("")):
+    """Show, line by line, what the inference recognised (or why not) without creating anything."""
+    get_current_user(request)
+    text, label, err = _rule_text_and_label(rule_text, asset_id)
+    if err:
+        return _rules_page(request, error=err)
+    return _rules_page(request, inferred=rule_inference.infer(text), inferred_label=label or "pasted text",
+                       inferred_source={"asset_id": asset_id, "text": "" if asset_id else rule_text})
+
+
+@app.post("/api/transformation-rules/suggestion")
+async def create_suggested_rule(request: Request):
+    """Turn one reviewed suggestion into a DRAFT rule. Lookup targets are exactly what the reviewer typed."""
+    user = get_current_user(request)
+    form = await request.form()
+    rule_type, rule_id = str(form.get("rule_type", "")), str(form.get("rule_id", ""))
+    field, evidence = str(form.get("source_field", "")), str(form.get("evidence", ""))
+    try:
+        if rule_type == "VALUE_MAP":
+            pairs = {}
+            for key, val in form.multi_items():
+                if key.startswith("value::"):
+                    target = str(form.get("target::" + key[7:], "")).strip()
+                    if target:
+                        pairs[str(val).strip()] = target
+            if not pairs:
+                return _rules_redirect("error", "Enter the canonical value for at least one source value before saving the lookup.")
+            params = {"map": pairs, "case_insensitive": True}
+        else:
+            params = json.loads(str(form.get("params_json", "{}")))
+        desc = f"Suggested from the data in {field or 'a source column'}: {evidence}"[:900]
+        conn = get_db_connection()
+        try:
+            rule = transformation_rules.create_rule_version(conn, rule_id, rule_type, desc, params, user["name"])
+            conn.commit()
+        finally:
+            conn.close()
+    except (ValueError, TypeError) as exc:
+        return _rules_redirect("error", str(exc))
+    state_store.audit_log.append({"event": "TRANSFORMATION_RULE_SUGGESTED", "actor": user["name"], "timestamp_utc": rule["created_utc"],
+                                  "details": {"rule": rule["expression"], "type": rule_type, "field": field}})
+    return _rules_redirect("notice", f"{rule['expression']} saved as a draft from the suggestion for {field}. It needs approval before a mapping can use it.")
+
+
+@app.post("/api/transformation-rules/preview")
+async def preview_transformation_rule(request: Request, rule_type: str = Form(...), params_json: str = Form(...), samples: str = Form("")):
+    get_current_user(request)
+    try:
+        params = json.loads(params_json)
+        rows = transformation_rules.preview(rule_type, params, [line for line in samples.splitlines() if line.strip() != ""] or [""])
+    except (ValueError, TypeError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    return JSONResponse({"ok": True, "rows": rows})
+
+
+def _shorten(text: str, limit: int) -> str:
+    """Cut at a word boundary and mark the cut, so notices never end mid-word."""
+    text = " ".join(str(text).split())
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0].rstrip(",;:.") + "…"
+
+
+@app.post("/api/transformation-rules/infer")
+async def infer_transformation_rules(request: Request, rule_text: str = Form(""), asset_id: str = Form("")):
+    """Turn business-rule text into DRAFT governed rules. Each still needs Analyst/Admin approval; unmatched sentences are reported, not guessed."""
+    user = get_current_user(request)
+    rule_text, label, err = _rule_text_and_label(rule_text, asset_id)
+    if err:
+        return _rules_redirect("error", err)
+    conn = get_db_connection()
+    try:
+        result = rule_inference.save_drafts(conn, rule_text, user["name"], label)
+        conn.commit()
+    finally:
+        conn.close()
+    for item in result["created"]:
+        state_store.audit_log.append({"event": "TRANSFORMATION_RULE_INFERRED", "actor": user["name"], "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                                      "details": {"rule": item["rule"], "source_text": item["statement"][:300]}})
+    parts = [f"{len(result['created'])} draft rule(s) inferred ({', '.join(i['rule'] for i in result['created']) or 'none'}); each needs approval before use"]
+    if result["skipped"]:
+        parts.append(f"{len(result['skipped'])} already exist")
+    if result["unrecognised"]:
+        examples = " | ".join(_shorten(u["statement"], 60) for u in result["unrecognised"][:2])
+        parts.append(f"{len(result['unrecognised'])} line(s) not recognised, e.g. {examples}")
+    return _rules_redirect("error" if not result["created"] and not result["skipped"] else "notice", "; ".join(parts) + ".")
+
+
+@app.post("/api/transformation-rules")
+async def create_transformation_rule(request: Request, rule_id: str = Form(...), rule_type: str = Form(...),
+                                     description: str = Form(...), params_json: str = Form(...)):
+    user = get_current_user(request)
+    conn = get_db_connection()
+    try:
+        try:
+            rule = transformation_rules.create_rule_version(conn, rule_id, rule_type, description, json.loads(params_json), user["name"])
+        except (ValueError, TypeError) as exc:
+            return _rules_redirect("error", str(exc))
+        conn.commit()
+    finally:
+        conn.close()
+    state_store.audit_log.append({"event": "TRANSFORMATION_RULE_DRAFTED", "actor": user["name"],
+                                  "timestamp_utc": rule["created_utc"], "details": {"rule": rule["expression"], "type": rule_type}})
+    return _rules_redirect("notice", f"{rule['expression']} saved as a draft. It cannot be used by a mapping until it is approved.")
+
+
+@app.post("/api/transformation-rules/{rule_id}/{version}/decision")
+async def decide_transformation_rule(request: Request, rule_id: str, version: int, decision: str = Form(...), comments: str = Form("")):
+    user = get_current_user(request)
+    conn = get_db_connection()
+    try:
+        try:
+            rule = transformation_rules.decide_rule(conn, rule_id, version, decision.strip().upper(), user["name"], comments)
+        except LookupError:
+            raise HTTPException(status_code=404, detail="Rule version not found.")
+        except ValueError as exc:
+            return _rules_redirect("error", str(exc))
+        conn.commit()
+    finally:
+        conn.close()
+    state_store.audit_log.append({"event": "TRANSFORMATION_RULE_" + rule["status"], "actor": user["name"],
+                                  "timestamp_utc": rule["reviewed_utc"], "details": {"rule": rule["expression"], "comments": comments.strip()}})
+    return _rules_redirect("notice", f"{rule['expression']} {rule['status'].lower()}.")
+
+
+@app.post("/api/transformation-rules/{rule_id}/{version}/retire")
+async def retire_transformation_rule(request: Request, rule_id: str, version: int):
+    user = get_current_user(request)
+    conn = get_db_connection()
+    try:
+        try:
+            rule = transformation_rules.retire_rule(conn, rule_id, version, user["name"])
+        except LookupError:
+            raise HTTPException(status_code=404, detail="Rule version not found.")
+        except ValueError as exc:
+            return _rules_redirect("error", str(exc))
+        conn.commit()
+    finally:
+        conn.close()
+    state_store.audit_log.append({"event": "TRANSFORMATION_RULE_RETIRED", "actor": user["name"],
+                                  "timestamp_utc": rule["reviewed_utc"], "details": {"rule": rule["expression"]}})
+    return _rules_redirect("notice", f"{rule['expression']} retired.")
+
+
+@app.get("/canonical-changes", response_class=HTMLResponse)
+async def canonical_changes_page(request: Request, notice: str = "", error: str = ""):
+    user = get_current_user(request)
+    migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    conn = get_db_connection()
+    try:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM canonical_change_requests WHERE migration_id = ? ORDER BY created_utc DESC", (migration_id,)).fetchall()]
+        applied = canonical_overlay.applied_request_ids(conn)
+        conn.commit()
+    finally:
+        conn.close()
+    for row in rows:
+        row["applied_utc"] = applied.get(row["request_id"])
+        if row["applied_utc"] and row["change_type"] == "ADD_FIELD":
+            row["yaml_snippet"] = canonical_overlay.yaml_snippet(row["entity_name"], row["canonical_field"].strip().upper(), row["proposed_change"])
+    return render_template_with_context(request, "canonical_changes.html", {
+        "space": "gov",
+        "page_title": "Canonical Change Requests", "user_name": user["name"], "user_role": user["role"],
+        "requests": rows, "change_types": CHANGE_TYPES, "entities": CHANGE_ENTITIES,
+        "can_raise": user["role"] in CHANGE_REQUEST_ROLES, "can_decide": user["role"] in CANONICAL_ROLES,
+        "notice": notice, "error": error,
+    })
+
+
+def _changes_redirect(key: str, message: str):
+    return RedirectResponse(url=f"/canonical-changes?{key}=" + quote_plus(message), status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/api/canonical-changes")
+async def raise_canonical_change(
+    request: Request,
+    entity_name: str = Form(...),
+    canonical_field: str = Form(...),
+    change_type: str = Form(...),
+    proposed_change: str = Form(...),
+    reason: str = Form(...),
+):
+    user = get_current_user(request)
+    entity_name, canonical_field = entity_name.strip(), canonical_field.strip()
+    if entity_name not in CHANGE_ENTITIES:
+        return _changes_redirect("error", "Choose Account, Household or Client.")
+    if change_type not in CHANGE_TYPES:
+        return _changes_redirect("error", "Choose a change type.")
+    if not canonical_field or not proposed_change.strip() or not reason.strip():
+        return _changes_redirect("error", "Field, proposed change and reason are all required.")
+    migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    request_id = "CCR-" + uuid.uuid4().hex[:10].upper()
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            "INSERT INTO canonical_change_requests (request_id, migration_id, entity_name, canonical_field, change_type, "
+            "proposed_change, reason, status, requested_by, created_utc) VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)",
+            (request_id, migration_id, entity_name, canonical_field, change_type, proposed_change.strip(),
+             reason.strip(), user["name"], datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+    finally:
+        conn.close()
+    state_store.audit_log.append({
+        "event": "CANONICAL_CHANGE_REQUESTED", "actor": user["name"],
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "details": {"request_id": request_id, "entity": entity_name, "field": canonical_field, "change_type": change_type},
+    })
+    return _changes_redirect("notice", f"{request_id} raised for {entity_name}.{canonical_field}; the Domain SME will review it.")
+
+
+@app.post("/api/canonical-changes/{request_id}/apply")
+async def apply_canonical_change(request: Request, request_id: str):
+    """Apply an approved change request to the canonical model as an audited overlay."""
+    user = get_current_user(request)
+    conn = get_db_connection()
+    try:
+        row = conn.execute("SELECT * FROM canonical_change_requests WHERE request_id = ?", (request_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Canonical change request not found.")
+        existing = []
+        try:
+            cfg = load_firm_config()
+            existing = cfg.canonical_field_names(row["entity_name"]) if row["entity_name"] in cfg.entities else []
+        except FirmConfigError:
+            pass
+        try:
+            record = canonical_overlay.apply_request(conn, dict(row), user["name"], existing)
+        except ValueError as exc:
+            return _changes_redirect("error", str(exc))
+        conn.commit()
+    finally:
+        conn.close()
+    state_store.audit_log.append({
+        "event": "CANONICAL_CHANGE_APPLIED", "actor": user["name"],
+        "timestamp_utc": record["applied_utc"],
+        "details": {"request_id": request_id, "entity": record["entity_name"], "field": record["canonical_field"], "change_type": record["change_type"]},
+    })
+    return _changes_redirect("notice", f"{request_id} applied to the canonical model.")
+
+
+@app.post("/api/canonical-changes/{request_id}/decision")
+async def decide_canonical_change(request: Request, request_id: str, decision: str = Form(...), note: str = Form("")):
+    user = get_current_user(request)
+    decision = decision.strip().upper()
+    if decision not in CHANGE_DECISIONS:
+        return _changes_redirect("error", "Choose approve, reject or defer.")
+    if decision in {"REJECTED", "DEFERRED"} and not note.strip():
+        return _changes_redirect("error", "Enter a note when rejecting or deferring a change request.")
+    conn = get_db_connection()
+    try:
+        row = conn.execute("SELECT status FROM canonical_change_requests WHERE request_id = ?", (request_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Canonical change request not found.")
+        if row["status"] not in {"OPEN", "DEFERRED"}:
+            return _changes_redirect("error", f"{request_id} is already {row['status'].lower()}.")
+        conn.execute(
+            "UPDATE canonical_change_requests SET status = ?, decided_by = ?, decided_utc = ?, decision_note = ? WHERE request_id = ?",
+            (decision, user["name"], datetime.now(timezone.utc).isoformat(), note.strip(), request_id))
+        conn.commit()
+    finally:
+        conn.close()
+    state_store.audit_log.append({
+        "event": "CANONICAL_CHANGE_DECIDED", "actor": user["name"],
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "details": {"request_id": request_id, "decision": decision, "note": note.strip()},
+    })
+    return _changes_redirect("notice", f"{request_id} {decision.lower()}.")
+
+
+@app.post("/api/knowledge/submit-questionnaire")
+async def submit_questionnaire(
+    firm_name: str = Form(...),
+    source_systems: str = Form(""),
+    business_data_owner: str = Form(""),
+    mapping_approver: str = Form(""),
+    identifier_relationship_notes: str = Form("")
+):
+    """Save only the discovery context needed for P0 source-to-canonical mapping."""
+    form_payload = {
+        "firm_name": firm_name.strip(),
+        "source_systems": source_systems.strip(),
+        "business_data_owner": business_data_owner.strip(),
+        "mapping_approver": mapping_approver.strip(),
+        "identifier_relationship_notes": identifier_relationship_notes.strip(),
+    }
+    state_store.update_questionnaire_from_form(form_payload)
+    migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    publish_event("MIGRATION_CONTEXT_UPDATED", migration_id, "migration", migration_id, form_payload, "business-data-owner")
+    return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/api/entities/save-scopes")
+async def save_entity_scopes(request: Request):
+    form_data = await request.form()
+    configured_scope = set(state_store.questionnaire_data.get("migration_setup", {}).get("entities", []))
+    scopes_map = {entity: "OUT_OF_SCOPE" for entity in ("Account", "Household", "Client") if entity not in configured_scope}
+    for key, value in form_data.items():
+        if key.startswith("scope_"):
+            entity_name = key.replace("scope_", "")
+            if entity_name in configured_scope and entity_name in {"Account", "Household", "Client"}:
+                scopes_map[entity_name] = str(value)
+
+    state_store.save_entity_scopes(scopes_map)
+    migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    publish_event("ENTITY_SCOPES_UPDATED", migration_id, "migration", migration_id, {"scopes": scopes_map}, "migration-analyst")
+    return RedirectResponse(url="/entity-sample-files", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/api/entities/upload-sample-file")
+async def upload_entity_sample_file(
+    request: Request,
+    files: List[UploadFile] = File(...),
+    source_role: str = Form("ENTITY_MASTER"),
+    source_context: str = Form(""),
+    data_dictionary_notes: str = Form(""),
+):
+    """Batch-inspect files. Optional context refines inference but is never required to attempt it."""
+    get_current_user(request)
+    configured_scope = state_store.questionnaire_data.get("migration_setup", {}).get("entities", [])
+    if not configured_scope:
+        raise HTTPException(status_code=400, detail="Select at least one in-scope entity in Migration Setup first.")
+
+    registered, needs_review, excluded, failed, duplicates = [], [], [], [], []
+    shared_context = " ".join([source_context.strip(), data_dictionary_notes.strip()]).strip()
+    for file in files:
+        filename = file.filename or "unknown-file"
+        try:
+            content = await file.read()
+            records = read_source_records(filename, content)
+            headers = list(records[0].keys()) if records else []
+            # Always attempt inference from file evidence first; context is optional enrichment.
+            from control_plane.services.entity_classification_agent import classify_source_file
+            inference = classify_source_file(headers, records=records, context=shared_context)
+        except (ValueError, OSError) as exc:
+            failed.append(f"{filename}: {str(exc)}")
+            continue
+
+        if inference.get("status") == "NEEDS_CLARIFICATION" or inference.get("entity") not in {"Account", "Household", "Client"}:
+            entity_name = "Needs clarification"
+            needs_review.append(filename)
+        else:
+            entity_name = inference["entity"]
+            if entity_name not in configured_scope:
+                excluded.append(f"{filename} ({entity_name})")
+
+        normalized_role = (
+            "RELATIONSHIP_EXTRACT" if inference.get("classification_type") == "RELATIONSHIP"
+            else "ACCOUNT_MASTER" if entity_name == "Account"
+            else "ENTITY_MASTER"
+        )
+        try:
+            record = state_store.attach_entity_sample_file(entity_name, filename, content, source_role=normalized_role)
+            if record.pop("_duplicate_upload", False):
+                duplicates.append(filename)
+                continue
+        except ValueError as exc:
+            failed.append(f"{filename}: {str(exc)}")
+            continue
+        record["inference"] = inference
+        record["inference_approval_status"] = "PENDING"
+        record["source_context"] = source_context.strip()
+        record["data_dictionary_notes"] = data_dictionary_notes.strip()
+        try:
+            agent_analysis = MigrationAgentCoordinator().analyze(
+                records, context=shared_context, in_scope=configured_scope,
+            )
+            agent_analysis["file_id"] = record["file_id"]
+            agent_analysis["filename"] = record["filename"]
+            agent_analysis["analyzed_by"] = "XODUS discovery"
+            agent_analysis["analyzed_utc"] = datetime.now(timezone.utc).isoformat()
+            record["agent_analysis"] = agent_analysis
+        except (ValueError, KeyError, TypeError):
+            record["agent_analysis"] = {
+                "classification": {"status": "NEEDS_REVIEW", "entity": entity_name, "message": "Automated analysis needs review; entity approval remains pending."},
+                "profile": {"row_count": len(records), "column_count": len(headers), "candidate_key_fields": []},
+                "mapping": {"proposals": []},
+                "review": {"status": "NEEDS_REVIEW", "blockers": ["Agent analysis did not complete; review the source file manually."]},
+                "file_id": record["file_id"], "filename": record["filename"],
+            }
+        # Publish only after inference, source context, dictionary notes, and analysis
+        # are attached so the durable event contains the complete reviewable file record.
+        publish_event(
+            "SOURCE_FILE_UPLOADED", str(record.get("migration_id", "MIG-UNCONFIGURED")),
+            "source_file", str(record["file_id"]),
+            _workflow_safe_source_payload(record, entity_name, normalized_role),
+            "migration-analyst",
+        )
+        state_store.audit_log.append({
+            "event": "SOURCE_ENTITY_INFERRED", "actor": "SourceDiscovery",
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "details": {"filename": filename, "entity": entity_name,
+                        "confidence": inference.get("confidence"), "status": inference.get("status")},
+        })
+        if entity_name == "Needs clarification":
+            continue
+        registered.append(f"{filename} → {entity_name}")
+
+    summary = [f"Batch complete: {len(registered)} classified and registered"]
+    if needs_review: summary.append(f"{len(needs_review)} needs review ({', '.join(needs_review)})")
+    if excluded: summary.append(f"{len(excluded)} retained as out of scope ({', '.join(excluded)})")
+    if failed: summary.append(f"{len(failed)} failed validation ({'; '.join(failed)})")
+    if duplicates: summary.append(f"{len(duplicates)} identical re-uploads recognized; existing records preserved ({', '.join(duplicates)})")
+    notice = ". ".join(summary) + ". Files are retained even when out of scope or awaiting clarification. Re-uploading identical content is idempotent; same-name files with different content remain separate."
+    return RedirectResponse(url="/entity-sample-files?notice=" + quote_plus(notice) + "#discovered-source-inventory", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/api/entities/confirm-entity")
+async def confirm_entity_scope_bulk(request: Request, entity_name: str = Form(...), comments: str = Form("")):
+    """Approve all files for an entity in one action only when every file has clear inference evidence."""
+    user = get_current_user(request)
+    if entity_name not in {"Account", "Household", "Client"}:
+        raise HTTPException(status_code=400, detail="Only Account, Household and Client are supported in P0.")
+    entity_files = state_store.entity_source_files.get(entity_name, {})
+    if not entity_files:
+        return RedirectResponse(url="/entity-sample-files?notice=" + quote_plus(f"No source files are registered for {entity_name}.") + "#discovered-source-inventory", status_code=status.HTTP_303_SEE_OTHER)
+    blockers = []
+    for record in entity_files.values():
+        inference = record.get("inference") or {}
+        evidence = inference.get("evidence", {}).get(entity_name, {})
+        matched_fields = evidence.get("matched_fields", [])
+        signature_fields = evidence.get("signature_fields", [])
+        if record.get("inference_approval_status") == "REJECTED" or inference.get("entity") != entity_name or inference.get("status") != "INFERRED" or not matched_fields or not signature_fields:
+            blockers.append(record.get("filename", "Unnamed file"))
+    if blockers:
+        message = "Entity-level approval blocked. Review these files individually first: " + ", ".join(blockers) + "."
+        return RedirectResponse(url="/entity-sample-files?notice=" + quote_plus(message) + "#discovered-source-inventory", status_code=status.HTTP_303_SEE_OTHER)
+    now = datetime.now(timezone.utc).isoformat()
+    approved_files = []
+    for record in entity_files.values():
+        record["inference_approval_status"] = "APPROVED"
+        record["inference_review"] = {
+            "decision": "APPROVE_ENTITY",
+            "reviewer": user.get("name", "Unknown reviewer"),
+            "comments": comments.strip() or "Entity-level approval: all registered files passed the evidence gate.",
+            "reviewed_utc": now,
+        }
+        approved_files.append(record.get("filename", "source file"))
+    state_store.entity_scopes[entity_name] = "IN_SCOPE"
+    migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    publish_event("ENTITY_INFERENCE_REVIEWED", migration_id, "entity", entity_name,
+                  {"decision": "APPROVE_ENTITY", "scope": "IN_SCOPE",
+                   "files": [{"file_id": item.get("file_id"), "filename": item.get("filename"),
+                              "inference_approval_status": item.get("inference_approval_status"),
+                              "inference_review": item.get("inference_review")}
+                             for item in entity_files.values()],
+                   "comments": comments.strip()}, user.get("name", "Unknown reviewer"))
+    state_store.audit_log.append({
+        "event": "ENTITY_LEVEL_INFERENCE_APPROVED",
+        "actor": user.get("name", "Unknown reviewer"),
+        "timestamp_utc": now,
+        "details": {"entity": entity_name, "files": approved_files, "comments": comments.strip()},
+    })
+    message = f"Approved {entity_name} entity scope and {len(approved_files)} file(s): " + ", ".join(approved_files)
+    return RedirectResponse(url="/entity-sample-files?notice=" + quote_plus(message) + "#discovered-source-inventory", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/api/entities/confirm-inference")
+async def confirm_entity_inference(
+    entity_name: str = Form(...),
+    decision: str = Form(...),
+    comments: str = Form(""),
+    target_entity: str = Form(""),
+    request: Request = None,
+):
+    """Allow rejection of any retained file and explicit reclassification into an in-scope entity."""
+    user = get_current_user(request) if request is not None else {"name": "Unknown reviewer"}
+    form = await request.form() if request is not None else {}
+    file_id = str(form.get("file_id", "")).strip()
+    return _apply_inference_review(user, file_id, entity_name, decision, comments, target_entity)
+
+
+@app.post("/api/entities/review-selected")
+async def review_selected_source_files(request: Request):
+    """Table review of discovered source files: confirm or reject every ticked file, with a note and an optional
+    reclassification per row. Each file goes through the same single-file review."""
+    user = get_current_user(request)
+    form = await request.form()
+    ids = [str(i) for i in form.getlist("files")]
+    decision = str(form.get("decision", "")).strip().upper()
+    if decision not in {"APPROVE", "REJECT"}:
+        return RedirectResponse(url="/entity-sample-files?error=" + quote_plus("Choose confirm or reject."), status_code=status.HTTP_303_SEE_OTHER)
+    if not ids:
+        return RedirectResponse(url="/entity-sample-files?error=" + quote_plus("Tick at least one file first."), status_code=status.HTTP_303_SEE_OTHER)
+    common = str(form.get("common_note", "")).strip()
+    done, failed = 0, []
+    for fid in ids:
+        label, current = fid, ""
+        for bucket, files in state_store.entity_source_files.items():
+            for item in files.values():
+                if item.get("file_id") == fid:
+                    label, current = str(item.get("filename") or fid), str(item.get("inferred_entity") or bucket)
+        note = str(form.get("note::" + fid, "")).strip() or common
+        entity = str(form.get("entity::" + fid, "")).strip() or current
+        target = str(form.get("change::" + fid, "")).strip() or entity
+        try:
+            res = _apply_inference_review(user, fid, entity, decision, note, target)
+        except HTTPException as exc:
+            failed.append(f"{label}: {exc.detail}")
+            continue
+        loc = res.headers.get("location", "")
+        if "error=" in loc:
+            from urllib.parse import parse_qs, urlparse
+            failed.append(f"{label}: " + parse_qs(urlparse(loc).query).get("error", ["not changed"])[0])
+        else:
+            done += 1
+    kind, msg = _bulk_summary(done, failed, "confirmed" if decision == "APPROVE" else "rejected")
+    return RedirectResponse(url=f"/entity-sample-files?{kind}=" + quote_plus(msg), status_code=status.HTTP_303_SEE_OTHER)
+
+
+def _apply_inference_review(user: Dict[str, Any], file_id: str, entity_name: str, decision: str, comments: str, target_entity: str):
+    normalized_decision = decision.strip().upper()
+    if normalized_decision not in {"APPROVE", "REJECT"}:
+        return RedirectResponse(url="/entity-sample-files?error=" + quote_plus("Choose Confirm classification or Reject file.") + "", status_code=status.HTTP_303_SEE_OTHER)
+    if normalized_decision == "REJECT" and not comments.strip():
+        return RedirectResponse(url="/entity-sample-files?error=" + quote_plus("Enter a rejection reason before rejecting this file.") + "", status_code=status.HTTP_303_SEE_OTHER)
+
+    record = None
+    current_entity = None
+    for bucket_entity, files in state_store.entity_source_files.items():
+        for item in files.values():
+            if item.get("file_id") == file_id:
+                record, current_entity = item, bucket_entity
+                break
+        if record:
+            break
+    if record is None and entity_name in {"Account", "Household", "Client"}:
+        record = state_store.entity_sample_files.get(entity_name)
+        current_entity = entity_name if record else None
+    if not record:
+        raise HTTPException(status_code=404, detail="No retained source file was found for this review.")
+    if not record.get("inference"):
+        record["inference"] = {}
+
+    if normalized_decision == "REJECT":
+        record["inference_approval_status"] = "REJECTED"
+        record["discovery_status"] = "REJECTED"
+        reviewed_entity = record.get("inference", {}).get("entity") or current_entity or entity_name
+        record["inference_review"] = {
+            "decision": "REJECT", "reviewer": user.get("name", "Unknown reviewer"),
+            "comments": comments.strip(), "reviewed_utc": datetime.now(timezone.utc).isoformat(),
+        }
+    else:
+        selected_entity = (target_entity or entity_name).strip()
+        old_entity = current_entity
+        if selected_entity == "RELATIONSHIP_DEFERRED":
+            # Link/bridge files are relationship artifacts; P0 has no relationship entity, so record an explicit disposition.
+            if not comments.strip():
+                return RedirectResponse(url="/entity-sample-files?error=" + quote_plus("Enter a note explaining the relationship disposition (what the link joins and why it is deferred).") + "", status_code=status.HTTP_303_SEE_OTHER)
+            record["inferred_entity"] = "Relationship (deferred)"
+            record["inference"]["entity"] = "Relationship (deferred)"
+            record["inference"]["status"] = "RELATIONSHIP_DEFERRED"
+            record["inference_approval_status"] = "NOT_REQUIRED"
+            record["discovery_status"] = "RELATIONSHIP_DEFERRED"
+            record["inference_review"] = {
+                "decision": "RELATIONSHIP_DEFERRED", "reviewer": user.get("name", "Unknown reviewer"),
+                "comments": comments.strip(), "reviewed_utc": datetime.now(timezone.utc).isoformat(),
+                "previous_entity": old_entity, "confirmed_entity": "Relationship (deferred)",
+            }
+            reviewed_entity = "Relationship (deferred)"
+        elif selected_entity == "OUT_OF_SCOPE":
+            # Preserve the file in its current inventory bucket; only its eligibility changes.
+            record["inferred_entity"] = "Out of scope"
+            record["inference"]["entity"] = "Out of scope"
+            record["inference"]["status"] = "OUT_OF_SCOPE"
+            record["inference_approval_status"] = "NOT_REQUIRED"
+            record["discovery_status"] = "OUT_OF_SCOPE"
+            record["inference_review"] = {
+                "decision": "OUT_OF_SCOPE", "reviewer": user.get("name", "Unknown reviewer"),
+                "comments": comments.strip(), "reviewed_utc": datetime.now(timezone.utc).isoformat(),
+                "previous_entity": old_entity, "confirmed_entity": "Out of scope",
+            }
+            reviewed_entity = "Out of scope"
+        else:
+            if selected_entity not in {"Account", "Household", "Client"}:
+                raise HTTPException(status_code=400, detail="Select Account, Household, Client or Out of scope.")
+            configured_scope = state_store.questionnaire_data.get("migration_setup", {}).get("entities", [])
+            if selected_entity not in configured_scope:
+                raise HTTPException(status_code=409, detail=f"{selected_entity} is not selected in Migration Setup. Re-enable it before classifying this file.")
+            if old_entity != selected_entity:
+                # Buckets are keyed by source role/filename, not file_id. Remove the
+                # existing entry by its durable identity before moving it to the new bucket.
+                old_files = state_store.entity_source_files.setdefault(old_entity, {})
+                for old_key, old_record in list(old_files.items()):
+                    if str(old_record.get("file_id", "")) == file_id:
+                        old_files.pop(old_key, None)
+                        break
+                if state_store.entity_sample_files.get(old_entity, {}).get("file_id") == file_id:
+                    state_store.entity_sample_files.pop(old_entity, None)
+                new_files = state_store.entity_source_files.setdefault(selected_entity, {})
+                new_key = str(record.get("source_role", "ENTITY_MASTER"))
+                if new_key in new_files:
+                    new_key = new_key + ":" + str(record.get("filename", "source")) + ":" + file_id
+                new_files[new_key] = record
+            record["entity"] = selected_entity
+            record["entity_name"] = selected_entity
+            record["inferred_entity"] = selected_entity
+            record["inference"]["entity"] = selected_entity
+            record["inference"]["status"] = "INFERRED"
+            record["inference_approval_status"] = "APPROVED"
+            record["discovery_status"] = "APPROVED"
+            record["inference_review"] = {
+                "decision": "APPROVE", "reviewer": user.get("name", "Unknown reviewer"),
+                "comments": comments.strip(), "reviewed_utc": datetime.now(timezone.utc).isoformat(),
+                "previous_entity": old_entity, "confirmed_entity": selected_entity,
+            }
+            if record.get("source_role") in {"ENTITY_MASTER", "ACCOUNT_MASTER"}:
+                state_store.entity_sample_files[selected_entity] = record
+            reviewed_entity = selected_entity
+            state_store.entity_scopes[selected_entity] = "IN_SCOPE"
+
+    migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    publish_event("ENTITY_INFERENCE_REVIEWED", migration_id, "source_file", str(record.get("file_id", file_id)),
+                  {"entity": reviewed_entity, "previous_entity": current_entity, "filename": record.get("filename"),
+                   "decision": normalized_decision, "inference_approval_status": record["inference_approval_status"],
+                   "inference": record.get("inference"), "inference_review": record["inference_review"],
+                   "scope": state_store.entity_scopes.get(reviewed_entity, "OUT_OF_SCOPE")}, user.get("name", "Unknown reviewer"))
+    state_store.audit_log.append({
+        "event": "ENTITY_INFERENCE_REVIEWED", "actor": user.get("name", "Unknown reviewer"),
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "details": {"entity": reviewed_entity, "previous_entity": current_entity,
+                    "filename": record.get("filename"), "decision": normalized_decision, "comments": comments.strip()},
+    })
+    outcome = "rejected" if normalized_decision == "REJECT" else "confirmed as " + str(reviewed_entity)
+    notice = quote_plus(str(record.get("filename", "File")) + " " + outcome + ".")
+    return RedirectResponse(url=f"/entity-sample-files?notice={notice}", status_code=status.HTTP_303_SEE_OTHER)
+
+def _preview_only_mapping(mapping_res: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip row-level canonical output and raw samples from all preview API responses."""
+    safe_mapping = dict(mapping_res)
+    records = safe_mapping.pop("mapped_records", [])
+    safe_mapping["preview_record_count"] = safe_mapping.get("record_count", len(records))
+    safe_mapping["mapped_records_withheld"] = True
+    safe_mapping["approval_status"] = "PENDING_REVIEW"
+    safe_mapping["canonical_output_status"] = "PREVIEW_ONLY_PENDING_APPROVAL"
+    safe_mapping["field_lineages"] = [
+        {key: value for key, value in lineage.items() if key != "sample_value"}
+        for lineage in safe_mapping.get("field_lineages", [])
+    ]
+    safe_mapping.pop("relationship_candidates", None)
+    return safe_mapping
+
+
+def _template_mapping_seeds(migration_id: str, entity_name: str) -> Dict[str, Any]:
+    """Source-to-canonical names approved in the template migration this one was started from (names only, never approvals).
+    Returns {"template_id", "template_name", "seeds": {source_field: canonical_field}}; empty seeds when there is no template."""
+    template_id = str((state_store.questionnaire_data.get("migration_template") or {}).get("template_migration_id") or "")
+    if not template_id or template_id == str(migration_id):
+        return {"template_id": "", "template_name": "", "seeds": {}}
+    conn = get_db_connection()
+    try:
+        rows = conn.execute("SELECT source_field, canonical_field FROM canonical_mappings WHERE migration_id = ? AND entity_name = ? AND is_confirmed = 1",
+                            (template_id, entity_name)).fetchall()
+        name = next((m["name"] for m in migration_registry.list_migrations(conn, str(migration_id)) if m["id"] == template_id), template_id)
+    finally:
+        conn.close()
+    return {"template_id": template_id, "template_name": name, "seeds": {r["source_field"]: r["canonical_field"] for r in rows}}
+
+
+def _get_approved_mapping_rules(migration_id: str, entity_name: str) -> Dict[str, Dict[str, str]]:
+    """Return approved target fields and transformation expressions for one migration/entity."""
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            "SELECT source_field, canonical_field, transformation_expression FROM canonical_mappings "
+            "WHERE migration_id = ? AND entity_name = ? AND is_confirmed = 1",
+            (migration_id, entity_name),
+        ).fetchall()
+        return {
+            row["source_field"]: {
+                "canonical_field": row["canonical_field"],
+                "transformation_expression": (row["transformation_expression"] or "DIRECT_COPY").strip().upper(),
+            }
+            for row in rows
+        }
+    finally:
+        conn.close()
+
+
+def _proposal_covered_fields(migration_id: str, entity_name: str, statuses: tuple, exclude_run_id: str = "") -> set:
+    """Canonical fields already supplied by proposals of this entity in this migration, across all files."""
+    conn = get_db_connection()
+    try:
+        marks = ",".join("?" for _ in statuses)
+        rows = conn.execute(
+            f"""SELECT DISTINCT canonical_field FROM mapping_suggestions
+                WHERE migration_id = ? AND entity_name = ? AND status IN ({marks})
+                  AND canonical_field IS NOT NULL AND run_id != ?""",
+            (migration_id, entity_name, *statuses, exclude_run_id),
+        ).fetchall()
+    finally:
+        conn.close()
+    return {str(r["canonical_field"]) for r in rows}
+
+
+def _sync_mapping_information_requests(migration_id: str) -> None:
+    """Keep information-request status derived from the approved mapping catalog."""
+    requests = state_store.questionnaire_data.setdefault("mapping_information_requests", [])
+    conn = get_db_connection()
+    try:
+        # Upsert in-memory requests before reloading the durable projection. The unique
+        # migration/entity/field key prevents duplicate open requests across reruns.
+        for item in requests:
+            item_migration = str(item.get("migration_id", migration_id))
+            if not item.get("request_id") or not item.get("entity") or not item.get("canonical_field"):
+                continue
+            conn.execute(
+                """INSERT INTO mapping_information_requests
+                (request_id, migration_id, entity_name, canonical_field, source_file, status,
+                 question, requested_by, created_utc, resolved_utc, resolution, response)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(migration_id, entity_name, canonical_field) DO UPDATE SET
+                    source_file = excluded.source_file,
+                    question = excluded.question,
+                    requested_by = excluded.requested_by,
+                    response = CASE WHEN excluded.response != '' THEN excluded.response
+                                    ELSE mapping_information_requests.response END""",
+                (item["request_id"], item_migration, str(item["entity"]), str(item["canonical_field"]),
+                 item.get("source_file"), item.get("status", "OPEN"), item.get("question", ""),
+                 item.get("requested_by", ""), item.get("created_utc", datetime.now(timezone.utc).isoformat()),
+                 item.get("resolved_utc"), item.get("resolution"), item.get("response", "")),
+            )
+        approved = {
+            (str(row["entity_name"]), str(row["canonical_field"]))
+            for row in conn.execute(
+                """
+                SELECT DISTINCT entity_name, canonical_field
+                FROM canonical_mappings
+                WHERE migration_id = ? AND is_confirmed = 1
+                """,
+                (migration_id,),
+            ).fetchall()
+        }
+        # Reload the durable requests so a fresh application process sees the same work.
+        persisted_requests = conn.execute(
+            """SELECT request_id, migration_id, entity_name, canonical_field, source_file,
+                      status, question, requested_by, created_utc, resolved_utc, resolution, response
+               FROM mapping_information_requests ORDER BY created_utc, request_id"""
+        ).fetchall()
+        # Commit inserts/upserts before closing this connection; otherwise SQLite
+        # rolls them back and the in-memory list can advertise requests that do not exist.
+        conn.commit()
+    finally:
+        conn.close()
+
+    requests[:] = [{
+        "request_id": row["request_id"], "migration_id": row["migration_id"],
+        "entity": row["entity_name"], "canonical_field": row["canonical_field"],
+        "source_file": row["source_file"], "status": row["status"],
+        "question": row["question"], "requested_by": row["requested_by"],
+        "created_utc": row["created_utc"], "resolved_utc": row["resolved_utc"],
+        "resolution": row["resolution"], "response": row["response"],
+    } for row in persisted_requests]
+
+    now = datetime.now(timezone.utc).isoformat()
+    for item in requests:
+        if str(item.get("migration_id", migration_id)) != migration_id:
+            continue
+        key = (str(item.get("entity", "")), str(item.get("canonical_field", "")))
+        if key in approved:
+            if item.get("status") != "RESOLVED":
+                item["status"] = "RESOLVED"
+                item["resolved_utc"] = now
+                item["resolution"] = "Approved source-to-canonical mapping exists."
+        elif item.get("status") == "RESOLVED":
+            item["status"] = "OPEN"
+            item.pop("resolved_utc", None)
+            item.pop("resolution", None)
+
+    # Persist the projection after reconciling against the approved mapping catalog.
+    conn = get_db_connection()
+    try:
+        for item in requests:
+            conn.execute(
+                """UPDATE mapping_information_requests
+                   SET status = ?, resolved_utc = ?, resolution = ?, response = ?
+                   WHERE request_id = ?""",
+                (item.get("status", "OPEN"), item.get("resolved_utc"),
+                 item.get("resolution"), item.get("response", ""), item["request_id"]),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _get_approved_mapping_catalog(migration_id: str, entity_name: str) -> Dict[str, str]:
+    """Backward-compatible field alias view of explicitly approved rules."""
+    return {
+        source: rule["canonical_field"]
+        for source, rule in _get_approved_mapping_rules(migration_id, entity_name).items()
+    }
+
+
+def _map_uploaded_source_entity(entity_name: str, actor: str = "SourceMappingWorkflow", file_id: str = "") -> Dict[str, Any]:
+    """Profile and map the exact persisted source CSV, preserving source identifiers as strings."""
+    scope_entity = "Client" if entity_name == "Client" else entity_name
+    if scope_entity not in {"Account", "Household", "Client"}:
+        raise HTTPException(status_code=400, detail=f"{entity_name} is not part of the P0 MCL workflow.")
+    if state_store.entity_scopes.get(scope_entity) != "IN_SCOPE":
+        raise HTTPException(status_code=409, detail=f"{entity_name} maps to {scope_entity}, which is not explicitly IN_SCOPE.")
+    entity_files = state_store.entity_source_files.get(entity_name, {})
+    uploaded = next((item for item in entity_files.values() if item.get("file_id") == file_id), None) if file_id else state_store.entity_sample_files.get(entity_name)
+    if uploaded and uploaded.get("inference") and uploaded.get("inference_approval_status") != "APPROVED":
+        raise HTTPException(status_code=409, detail=f"Entity inference for {entity_name} must be approved before mapping.")
+    if not uploaded or uploaded.get("status") != "UPLOADED" or not uploaded.get("stored_path"):
+        raise HTTPException(status_code=409, detail=f"No valid uploaded source file is available for {entity_name}.")
+    if not file_store.is_file(uploaded["stored_path"]):
+        raise HTTPException(status_code=409, detail=f"The uploaded source file for {entity_name} is no longer available; upload it again.")
+
+    run_id = f"RUN-{uuid.uuid4().hex}"
+    content = file_store.read_bytes(uploaded["stored_path"])
+    try:
+        source_records = read_source_records(uploaded["filename"], content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # The current profiler consumes CSV bytes; serialize adapter-normalized records
+    # to profile the same logical rows regardless of the original source format.
+    import io
+    import pandas as pd
+    normalized_csv = pd.DataFrame(source_records).to_csv(index=False).encode("utf-8")
+    profile = SourceDataProfiler.profile_csv_content(uploaded["filename"], normalized_csv, entity_name=entity_name)
+    if profile.get("status") != "PROFILED":
+        raise HTTPException(status_code=400, detail=profile.get("error_message", "Source profiling failed."))
+    profile["source_format"] = Path(uploaded["filename"]).suffix.lower()
+    profile["run_id"] = run_id
+    profile["profile_id"] = state_store.persist_source_profile(profile, run_id=run_id)
+    # Approved rules are reusable only within the same migration and canonical entity.
+    migration_id = state_store.questionnaire_data.get("migration_id", "UNCONFIGURED")
+    approved_rules = _get_approved_mapping_rules(migration_id, entity_name)
+    template_seed = _template_mapping_seeds(str(migration_id), entity_name)
+    # Names approved in the template migration seed PROPOSALS only (no transformation, no approval); this migration's own approvals win.
+    approved_catalog = {
+        **template_seed["seeds"],
+        **{source: rule["canonical_field"] for source, rule in approved_rules.items()},
+    }
+    approved_transformations = {
+        source: rule["transformation_expression"] for source, rule in approved_rules.items()
+    }
+    effective_mapper = SchemaMapperAgent(
+        custom_catalog={**schema_mapper.catalog, **approved_catalog},
+        approved_transformations=approved_transformations,
+    )
+    mapping = effective_mapper.map_source_to_canonical(entity_name, source_records)
+    mapping["approved_reusable_rules_applied"] = [
+        {
+            "source_field": source,
+            "canonical_field": rule["canonical_field"],
+            "transformation_expression": rule["transformation_expression"],
+        }
+        for source, rule in approved_rules.items()
+        if any(source in record for record in source_records)
+    ]
+    mapping["entity"] = entity_name
+    mapping["canonical_entity"] = "Client" if entity_name == "Client" else entity_name
+    mapping["run_id"] = run_id
+    if template_seed["seeds"]:
+        for lineage in mapping.get("field_lineages", []):
+            if template_seed["seeds"].get(str(lineage.get("source_field"))) == lineage.get("canonical_field") and str(lineage.get("source_field")) not in approved_rules:
+                lineage["basis_note"] = f"Matches a mapping approved in {template_seed['template_name']}. Confirm it fits this firm."
+                lineage["from_template"] = template_seed["template_id"]
+    # Derive information requests from required canonical fields that remain unmapped.
+    # These requests are questions for the source owner/SME, never auto-filled defaults.
+    mapped_canonical = {
+        str(item.get("canonical_field") or item.get("target_field") or "")
+        for item in mapping.get("field_lineages", [])
+    }
+    required_fields = SchemaMapperAgent.required_fields(entity_name)
+    # Required fields are evaluated per entity across all files: another file's live proposal covers the field.
+    mapped_canonical |= _proposal_covered_fields(
+        str(migration_id), entity_name, ("PENDING", "APPROVED"), exclude_run_id=str(uploaded.get("last_mapping_run_id") or ""))
+    requests = state_store.questionnaire_data.setdefault("mapping_information_requests", [])
+    existing_requests = {
+        (item.get("entity"), item.get("canonical_field"))
+        for item in requests
+        if str(item.get("migration_id", migration_id)) == str(migration_id)
+    }
+    for canonical_field in required_fields:
+        if canonical_field not in mapped_canonical and (entity_name, canonical_field) not in existing_requests:
+            requests.append({
+                "request_id": f"RFI-{uuid.uuid4().hex[:10].upper()}",
+                "migration_id": migration_id,
+                "entity": entity_name,
+                "canonical_field": canonical_field,
+                "source_file": uploaded["filename"],
+                "status": "OPEN",
+                "question": f"Which source field or approved business rule supplies required field {canonical_field}?",
+                "requested_by": actor,
+                "created_utc": datetime.now(timezone.utc).isoformat(),
+                "response": "",
+            })
+    _sync_mapping_information_requests(str(migration_id))
+    # Mapper output is a preview; suggestions require human approval before canonical use.
+    mapping["approval_status"] = "PENDING_REVIEW" if mapping.get("field_lineages") else "NO_PROPOSALS"
+    mapping["information_requests_created"] = [
+        item for item in requests if item.get("entity") == entity_name and item.get("source_file") == uploaded["filename"] and item.get("status") == "OPEN"
+    ]
+    state_store.persist_mapping_lineage(mapping, run_id=run_id, actor=actor)
+    uploaded["mapping_generated"] = True
+    uploaded["last_mapping_run_id"] = run_id
+    publish_event("MAPPING_PROPOSALS_GENERATED", str(migration_id), "mapping_run", str(run_id),
+                  {"entity": entity_name, "source_file": uploaded["filename"],
+                   "file_id": uploaded.get("file_id"), "run_id": run_id,
+                   "proposal_count": len(mapping.get("field_lineages", [])),
+                   "information_request_count": len(mapping.get("information_requests_created", []))}, actor)
+    return {
+        "status": mapping.get("status", "UNKNOWN"),
+        "run_id": run_id,
+        "entity_name": entity_name,
+        "canonical_entity": mapping["canonical_entity"],
+        "source_file": uploaded["filename"],
+        "profile": profile,
+        "mapping": mapping,
+    }
+
+
+@app.post("/api/entities/map-uploaded-file")
+async def map_uploaded_entity_file(entity_name: str = Form(...), request: Request = None):
+    """Profile and map an uploaded MCL CSV or another explicitly supported canonical source entity."""
+    if entity_name not in {"Account", "Household", "Client"}:
+        raise HTTPException(status_code=409, detail="P0 uploaded-file mapping currently supports MCL: Account, Household, and Client.")
+    try:
+        form = await request.form() if request is not None else {}
+        file_id = str(form.get("file_id", "")).strip()
+        result = _map_uploaded_source_entity(entity_name, file_id=file_id) if file_id else _map_uploaded_source_entity(entity_name)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Uploaded-file mapping failed for %s", entity_name)
+        raise HTTPException(status_code=500, detail=f"Mapping failed; no success was reported: {type(exc).__name__}: {exc}") from exc
+    # Keep generated canonical-shaped rows inside the workflow for validation only.
+    # The API never exposes them as reusable/approved output.
+    if file_id:
+        for files in state_store.entity_source_files.values():
+            for record in files.values():
+                if record.get("file_id") == file_id:
+                    record["mapping_generated"] = True
+                    record["last_mapping_run_id"] = result.get("run_id")
+    mapping_preview = result.get("mapping", {})
+    mapping_preview["preview_record_count"] = len(mapping_preview.pop("mapped_records", []))
+    mapping_preview["mapped_records_withheld"] = True
+    for lineage in mapping_preview.get("field_lineages", []):
+        lineage.pop("sample_value", None)
+    result["execution_boundary"] = {
+        "source_to_canonical_only": True,
+        "target_loading": "NOT_RUN",
+        "wave_assignment": "DISABLED",
+        "canonical_output_status": "PREVIEW_ONLY_PENDING_APPROVAL",
+    }
+    if request is not None and "text/html" in request.headers.get("accept", ""):
+        return RedirectResponse(url="/agent-pipeline", status_code=status.HTTP_303_SEE_OTHER)
+    return JSONResponse(result)
+
+
+@app.post("/api/entities/map-approved-files")
+async def map_all_approved_source_files(request: Request):
+    """Create mapping proposals for every approved source file not mapped yet."""
+    user = get_current_user(request)
+    approved_files = []
+    configured_scope = set(state_store.questionnaire_data.get("migration_setup", {}).get("entities", []))
+    for entity_name, files in state_store.entity_source_files.items():
+        if entity_name not in configured_scope or entity_name not in {"Account", "Household", "Client"}:
+            continue
+        for record in files.values():
+            if record.get("inference_approval_status") == "APPROVED" and not record.get("mapping_generated"):
+                approved_files.append((entity_name, record))
+    if not approved_files:
+        message = "No new approved files are waiting for profiling. Confirm inferred entities first, or review existing proposals."
+        return RedirectResponse(url="/agent-pipeline?notice=" + quote_plus(message) + "#pending-mappings", status_code=status.HTTP_303_SEE_OTHER)
+    completed, failures = [], []
+    for entity_name, record in approved_files:
+        try:
+            result = _map_uploaded_source_entity(entity_name, actor=user.get("name", "SourceMappingWorkflow"), file_id=record.get("file_id", ""))
+            record["mapping_generated"] = True
+            record["last_mapping_run_id"] = result.get("run_id")
+            completed.append(record.get("filename", "source file"))
+        except HTTPException as exc:
+            failures.append(f"{record.get('filename', 'source file')}: {exc.detail}")
+        except Exception as exc:
+            logger.exception("Batch mapping failed for %s", record.get("filename"))
+            failures.append(f"{record.get('filename', 'source file')}: {type(exc).__name__}")
+    if completed:
+        message = f"Generated mapping proposals for {len(completed)} approved file(s): " + ", ".join(completed)
+        if failures:
+            message += f". {len(failures)} file(s) need attention: " + " | ".join(failures)
+        destination = "/agent-pipeline?notice=" + quote_plus(message) + "#pending-mappings"
+    else:
+        message = "No mapping proposals generated. " + " | ".join(failures)
+        destination = "/entity-sample-files?notice=" + quote_plus(message) + "#discovered-source-inventory"
+    state_store.audit_log.append({"event":"BATCH_SOURCE_MAPPING_PROPOSED","actor":user.get("name","Unknown reviewer"),"timestamp_utc":datetime.now(timezone.utc).isoformat(),"details":{"completed_files":completed,"failures":failures}})
+    return RedirectResponse(url=destination, status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/api/entities/map-mcl")
+async def map_mcl_uploaded_files():
+    """Run the MCL source-to-canonical flow across Account, Household, and Client."""
+    mcl_run_id = f"MCL-{uuid.uuid4().hex}"
+    source_entities = ["Account", "Household", "Client"]
+    # Validate all prerequisites before starting any profile/mapping work.
+    for entity_name in source_entities:
+        scope_entity = "Client" if entity_name == "Client" else entity_name
+        if state_store.entity_scopes.get(scope_entity) != "IN_SCOPE":
+            raise HTTPException(status_code=409, detail=f"MCL run blocked: {scope_entity} is not explicitly IN_SCOPE.")
+        uploaded = state_store.entity_sample_files.get(entity_name)
+        if not uploaded or uploaded.get("status") != "UPLOADED" or not uploaded.get("stored_path"):
+            raise HTTPException(status_code=409, detail=f"MCL run blocked: upload a valid {entity_name} source file first.")
+        if not file_store.is_file(uploaded["stored_path"]):
+            raise HTTPException(status_code=409, detail=f"MCL run blocked: the {entity_name} source file is missing; upload it again.")
+
+    entity_results = {}
+    try:
+        for entity_name in source_entities:
+            entity_results[entity_name] = _map_uploaded_source_entity(entity_name, actor="MCLSourceMappingWorkflow")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("MCL mapping run failed for %s", mcl_run_id)
+        raise HTTPException(status_code=500, detail=f"MCL run {mcl_run_id} failed before completion: {type(exc).__name__}: {exc}") from exc
+
+    mappings = {name: result["mapping"] for name, result in entity_results.items()}
+    relationship_validation = validate_mcl_relationships(mappings)
+    mapping_statuses = {result["mapping"].get("status") for result in entity_results.values()}
+    if relationship_validation["status"] == "FAIL" or "WARNING_INCOMPLETE" in mapping_statuses or "NO_SOURCE_RECORDS" in mapping_statuses:
+        overall_status = "NEEDS_REMEDIATION"
+    elif relationship_validation["status"] == "WARN" or mapping_statuses - {"SUCCESS"}:
+        overall_status = "NEEDS_REVIEW_WITH_WARNINGS"
+    else:
+        overall_status = "NEEDS_REVIEW"
+
+    execution_boundary = {
+        "source_to_canonical_only": True,
+        "target_loading": "NOT_RUN",
+        "wave_assignment": "DISABLED",
+        "target_adapter": "NOT_SELECTED_IN_P0",
+        "canonical_output_status": "PREVIEW_ONLY_PENDING_APPROVAL",
+    }
+    try:
+        state_store.persist_mcl_execution_summary(
+            mcl_run_id=mcl_run_id,
+            status=overall_status,
+            entity_results=entity_results,
+            relationship_validation=relationship_validation,
+            execution_boundary=execution_boundary,
+        )
+        migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+        publish_event("MCL_EXECUTION_SUMMARY_PERSISTED", migration_id, "mcl_run", str(mcl_run_id),
+                      {"status": overall_status, "entities": list(entity_results.keys()),
+                       "relationship_status": relationship_validation.get("status"),
+                       "execution_boundary": execution_boundary}, "migration-analyst")
+    except Exception as exc:
+        logger.exception("Could not persist MCL execution summary for %s", mcl_run_id)
+        raise HTTPException(status_code=500, detail=f"MCL results were produced but batch lineage could not be persisted for {mcl_run_id}: {type(exc).__name__}: {exc}") from exc
+
+    # Relationship checks use in-memory preview rows above. Never return
+    # canonical-shaped source records or raw identifier values from this API.
+    for result in entity_results.values():
+        mapping_preview = result.get("mapping", {})
+        mapping_preview["preview_record_count"] = len(mapping_preview.pop("mapped_records", []))
+        mapping_preview["mapped_records_withheld"] = True
+        mapping_preview.pop("relationship_candidates", None)
+        for lineage in mapping_preview.get("field_lineages", []):
+            lineage.pop("sample_value", None)
+    for check in relationship_validation.get("relationship_checks", []):
+        check.pop("orphan_values", None)
+
+    return JSONResponse({
+        "status": overall_status,
+        "mcl_run_id": mcl_run_id,
+        "migration_id": state_store.questionnaire_data.get("migration_id", "UNCONFIGURED"),
+        "entities": entity_results,
+        "relationship_validation": relationship_validation,
+        "execution_boundary": execution_boundary,
+    })
+
+
+@app.post("/api/mapping-gaps/{request_id}/response")
+async def respond_to_mapping_information_request(request_id: str, request: Request,
+                                                 response_text: str = Form(...)):
+    user = get_current_user(request)
+    answer = response_text.strip()
+    if not answer:
+        raise HTTPException(status_code=400, detail="A response is required.")
+    migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    _sync_mapping_information_requests(migration_id)
+    requests = state_store.questionnaire_data.setdefault("mapping_information_requests", [])
+    item = next((entry for entry in requests if entry.get("request_id") == request_id), None)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Information request not found.")
+    if item.get("status") != "OPEN":
+        raise HTTPException(status_code=409, detail="This information request is already closed.")
+    responded_utc = datetime.now(timezone.utc).isoformat()
+    conn = get_db_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        durable = conn.execute(
+            "SELECT status FROM mapping_information_requests WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+        if durable is None:
+            conn.rollback()
+            raise HTTPException(status_code=409, detail="Information request is not persisted yet; refresh and retry.")
+        if durable["status"] != "OPEN":
+            conn.rollback()
+            item["status"] = durable["status"]
+            raise HTTPException(status_code=409, detail="This information request was changed by another workflow action.")
+        updated = conn.execute(
+            """UPDATE mapping_information_requests
+               SET response = ?, status = 'ANSWERED'
+               WHERE request_id = ?""",
+            (answer, request_id),
+        )
+        if updated.rowcount != 1:
+            conn.rollback()
+            raise HTTPException(status_code=409, detail="Could not persist the information request response; refresh and retry.")
+        conn.commit()
+    finally:
+        conn.close()
+    item["response"] = answer
+    item["responded_by"] = user["name"]
+    item["responded_utc"] = responded_utc
+    item["status"] = "ANSWERED"
+    publish_event("MAPPING_INFORMATION_REQUEST_CHANGED", migration_id, "information_request", request_id,
+                  {"entity": item.get("entity"), "canonical_field": item.get("canonical_field"), "status": "ANSWERED", "response": answer},
+                  user["name"])
+    state_store.audit_log.append({"event":"MAPPING_INFORMATION_RESPONSE","actor":user["name"],"timestamp_utc":item["responded_utc"],"details":{"request_id":request_id,"entity":item.get("entity"),"canonical_field":item.get("canonical_field")}})
+    return RedirectResponse(url="/agent-pipeline", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.get("/api/workflow/state")
+async def get_workflow_state(migration_id: Optional[str] = None):
+    """Return durable workflow projections and the event sequence for cross-module refresh."""
+    active_id = str(migration_id or state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    return JSONResponse({
+        "migration_id": active_id,
+        "event_sequence": __import__("control_plane.services.workflow_event_engine", fromlist=["latest_event_sequence"]).latest_event_sequence(active_id),
+        "migration": get_projection(active_id, "migration", active_id),
+        "entities": {
+            entity: get_projection(active_id, "entity", entity)
+            for entity in ("Account", "Client", "Household")
+        },
+    })
+
+
+@app.post("/api/workflow/replay")
+async def replay_workflow_events(migration_id: Optional[str] = Form(None), rebuild: bool = Form(False)):
+    """Replay pending events, or rebuild projections from the complete journal."""
+    active_id = str(migration_id or state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+    replayed = replay_events(active_id, rebuild=rebuild)
+    if rebuild:
+        state_store.hydrate_from_durable_state()
+    return JSONResponse({"migration_id": active_id, "events_replayed": replayed,
+                         "projection_rebuilt": rebuild, "status": "SUCCESS"})
+
+
+@app.get("/api/mapping-suggestions")
+async def list_source_mapping_suggestions(status_filter: str = "PENDING", migration_id: str = ""):
+    """List proposed source-to-canonical mappings for the active migration (or an explicit migration_id; "ALL" spans migrations)."""
+    scope_migration = migration_id.strip() or str(state_store.questionnaire_data.get("migration_id", ""))
+    allowed = {"PENDING", "APPROVED", "REJECTED", "ALL"}
+    if status_filter not in allowed:
+        raise HTTPException(status_code=400, detail=f"status_filter must be one of {sorted(allowed)}.")
+    conn = get_db_connection()
+    try:
+        if status_filter == "ALL":
+            rows = conn.execute(
+                """
+                SELECT s.*,
+                       CASE WHEN EXISTS (
+                           SELECT 1 FROM canonical_mappings AS c
+                           WHERE c.migration_id = s.migration_id
+                             AND c.entity_name = s.entity_name
+                             AND c.source_field = s.source_field
+                             AND c.canonical_field = s.canonical_field
+                             AND c.is_confirmed = 1
+                       ) THEN 'APPROVED' ELSE s.status END AS effective_status
+                FROM mapping_suggestions AS s
+                ORDER BY s.created_utc DESC, s.source_field
+                """
+            ).fetchall()
+        elif status_filter == "PENDING":
+            rows = conn.execute(
+                """
+                SELECT s.* FROM mapping_suggestions AS s
+                WHERE s.status = 'PENDING'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM canonical_mappings AS c
+                      WHERE c.migration_id = s.migration_id
+                        AND c.entity_name = s.entity_name
+                        AND c.source_field = s.source_field
+                        AND c.canonical_field = s.canonical_field
+                        AND c.is_confirmed = 1
+                  )
+                ORDER BY s.created_utc DESC, s.source_field
+                """
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM mapping_suggestions WHERE status = ? ORDER BY created_utc DESC, source_field",
+                (status_filter,),
+            ).fetchall()
+        suggestions = []
+        for row in rows:
+            item = dict(row)
+            if scope_migration not in ("", "ALL") and item.get("migration_id") != scope_migration:
+                continue
+            item["mapping_kind"] = SchemaMapperAgent.mapping_kind(item.get("proposed_rule"), item.get("canonical_field"))
+            suggestions.append(item)
+        return JSONResponse({"status": "SUCCESS", "suggestions": suggestions})
+    finally:
+        conn.close()
+
+
+@app.post("/api/mapping-suggestions/{suggestion_id}/review")
+async def review_source_mapping_suggestion(
+    suggestion_id: str,
+    decision: str = Form(...),
+    reviewer: str = Form(...),
+    comments: str = Form(""),
+    rule_override: str = Form(""),
+    request: Request = None,
+    canonical_override: str = Form(""),
+):
+    """Record an explicit approve/reject decision and prevent repeat review."""
+    if request is not None:
+        user = get_current_user(request)
+        if user.get("role") not in APPROVAL_ROLES:
+            raise HTTPException(status_code=403, detail="Only Migration Analyst or Platform Admin may approve or reject mappings.")
+        reviewer_name = str(user.get("name", "")).strip()
+    else:
+        # Direct service-level invocation is retained for focused unit tests.
+        reviewer_name = reviewer.strip()
+    normalized = decision.strip().upper()
+    if normalized not in {"APPROVED", "REJECTED"}:
+        raise HTTPException(status_code=400, detail="Decision must be APPROVED or REJECTED.")
+    if not reviewer_name:
+        raise HTTPException(status_code=400, detail="Reviewer is required.")
+    if normalized == "REJECTED" and not comments.strip():
+        raise HTTPException(status_code=400, detail="A rejection reason is required so the mapping owner knows what to correct.")
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_db_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM mapping_suggestions WHERE suggestion_id = ?", (suggestion_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Mapping suggestion was not found.")
+        if row["status"] != "PENDING":
+            raise HTTPException(status_code=409, detail=f"Mapping suggestion is already {row['status']}.")
+        canonical_field = row["canonical_field"]
+        change_note = ""
+        new_canonical = canonical_override.strip() if isinstance(canonical_override, str) else ""
+        if normalized == "APPROVED" and new_canonical and new_canonical != canonical_field:
+            if new_canonical not in _canonical_field_lists().get(row["entity_name"], []):
+                conn.rollback()
+                raise HTTPException(status_code=400, detail=f"'{new_canonical}' is not a canonical {row['entity_name']} field.")
+            conn.execute("UPDATE mapping_suggestions SET canonical_field = ? WHERE suggestion_id = ? AND status = 'PENDING'",
+                         (new_canonical, suggestion_id))
+            change_note = f"Canonical field changed from {canonical_field or 'none'} to {new_canonical}."
+            canonical_field = new_canonical
+        comments = (change_note + " " + comments).strip() if change_note else comments
+        proposed_expression = str(row["proposed_rule"] or "DIRECT_COPY").strip().upper()
+        override = rule_override.strip().upper() if isinstance(rule_override, str) else ""
+        if normalized == "APPROVED" and override:
+            if not _typed_rule_ok(override):
+                conn.rollback()
+                raise HTTPException(status_code=400, detail=_RULE_NOT_REGISTERED.format(rule=override))
+            proposed_expression = override
+            conn.execute("UPDATE mapping_suggestions SET proposed_rule = ? WHERE suggestion_id = ? AND status = 'PENDING'", (override, suggestion_id))
+        if normalized == "APPROVED" and not SchemaMapperAgent.supports_transformation(proposed_expression):
+            detail = (
+                f"The rule '{proposed_expression}' is not executable yet. "
+                "Register a safe transformation handler before approving it for execution."
+            )
+            if request is not None and "text/html" in request.headers.get("accept", ""):
+                conn.rollback()
+                return RedirectResponse(
+                    url="/agent-pipeline?error=" + quote_plus(detail) + "#pending-mappings",
+                    status_code=status.HTTP_303_SEE_OTHER,
+                )
+            raise HTTPException(status_code=400, detail=detail)
+        conn.execute(
+            "UPDATE mapping_suggestions SET status = ?, reviewer = ?, review_comments = ?, reviewed_utc = ? "
+            "WHERE suggestion_id = ? AND status = 'PENDING'",
+            (normalized, reviewer_name, comments.strip(), now, suggestion_id),
+        )
+        # Only an explicit approval creates a reusable, migration-scoped rule.
+        # Rejections are auditable but never become confirmed canonical mappings.
+        if normalized == "APPROVED" and canonical_field:
+            conn.execute(
+                """
+                INSERT INTO canonical_mappings
+                (mapping_id, migration_id, entity_name, source_field, canonical_field,
+                 mapping_type, transformation_expression, confidence_score, is_confirmed,
+                 created_by, updated_utc)
+                VALUES (?, ?, ?, ?, ?, 'APPROVED_ALIAS', ?, ?, 1, ?, ?)
+                ON CONFLICT(mapping_id) DO UPDATE SET
+                    canonical_field = excluded.canonical_field,
+                    transformation_expression = excluded.transformation_expression,
+                    confidence_score = excluded.confidence_score,
+                    is_confirmed = 1,
+                    created_by = excluded.created_by,
+                    updated_utc = excluded.updated_utc
+                """,
+                (
+                    f"MAP-{row['migration_id']}-{row['entity_name']}-{row['source_field']}",
+                    row["migration_id"], row["entity_name"], row["source_field"],
+                    canonical_field, proposed_expression,
+                    float(row["confidence_score"] or 0.0), reviewer_name, now,
+                ),
+            )
+        conn.execute(
+            "INSERT INTO approvals (id, run_id, artifact_id, stage, decision, reviewer, comments, created_utc) "
+            "VALUES (?, ?, ?, 'SOURCE_TO_CANONICAL_MAPPING', ?, ?, ?, ?)",
+            (f"APR-{uuid.uuid4().hex}", row["run_id"], suggestion_id, normalized, reviewer_name, comments.strip(), now),
+        )
+        updated = conn.execute(
+            "SELECT * FROM mapping_suggestions WHERE suggestion_id = ?", (suggestion_id,)
+        ).fetchone()
+        conn.commit()
+        _sync_mapping_information_requests(str(row["migration_id"]))
+        publish_event("MAPPING_REVIEWED", str(row["migration_id"]), "mapping_suggestion", suggestion_id, {"entity": row["entity_name"], "source_field": row["source_field"], "canonical_field": canonical_field, "decision": normalized}, reviewer_name)
+        if request is not None and "text/html" in request.headers.get("accept", ""):
+            return RedirectResponse(url="/agent-pipeline", status_code=status.HTTP_303_SEE_OTHER)
+        return JSONResponse({"status": "SUCCESS", "suggestion": dict(updated)})
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as exc:
+        conn.rollback()
+        logger.exception("Mapping suggestion review failed for %s", suggestion_id)
+        raise HTTPException(status_code=500, detail="Could not persist mapping review decision.") from exc
+    finally:
+        conn.close()
+
+
+@app.post("/api/mapping-suggestions/approve-entity")
+async def approve_entity_mapping_suggestions(
+    request: Request,
+    entity_name: str = Form(...),
+    reviewer: str = Form(...),
+    comments: str = Form(""),
+):
+    """Approve all pending mappings for one entity atomically, only when every proposal is valid."""
+    user = get_current_user(request)
+    if user.get("role") not in APPROVAL_ROLES:
+        raise HTTPException(status_code=403, detail="Only Migration Analyst or Platform Admin may approve entity mappings.")
+    reviewer_name = str(user.get("name", "")).strip()
+    if entity_name not in {"Account", "Household", "Client"}:
+        raise HTTPException(status_code=400, detail="Only Account, Household and Client are supported in P0.")
+    if not reviewer_name:
+        raise HTTPException(status_code=400, detail="Reviewer is required.")
+    migration_id = str(state_store.questionnaire_data.get("migration_id", "UNCONFIGURED"))
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_db_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            """
+            SELECT * FROM mapping_suggestions
+            WHERE migration_id = ? AND entity_name = ? AND status = 'PENDING'
+              AND NOT EXISTS (
+                SELECT 1 FROM canonical_mappings AS c
+                WHERE c.migration_id = mapping_suggestions.migration_id
+                  AND c.entity_name = mapping_suggestions.entity_name
+                  AND c.source_field = mapping_suggestions.source_field
+                  AND c.canonical_field = mapping_suggestions.canonical_field
+                  AND c.is_confirmed = 1
+              )
+            ORDER BY source_field, created_utc
+            """,
+            (migration_id, entity_name),
+        ).fetchall()
+        if not rows:
+            conn.rollback()
+            message = f"No pending mapping proposals are waiting for {entity_name} approval."
+            return RedirectResponse(url="/agent-pipeline?notice=" + quote_plus(message) + "#pending-mappings", status_code=status.HTTP_303_SEE_OTHER)
+
+        blockers = []
+        source_targets = {}
+        for row in rows:
+            source_field = str(row["source_field"] or "").strip()
+            canonical_field = str(row["canonical_field"] or "").strip()
+            rule = str(row["proposed_rule"] or "DIRECT_COPY").strip().upper()
+            if not source_field or not canonical_field:
+                blockers.append(f"{source_field or '(missing source field)'}: unresolved canonical field")
+            if not SchemaMapperAgent.supports_transformation(rule):
+                blockers.append(f"{source_field or '(missing source field)'}: rule '{rule}' has no registered safe execution handler")
+            prior_target = source_targets.get(source_field)
+            if prior_target and prior_target != canonical_field:
+                blockers.append(f"{source_field}: conflicting canonical targets {prior_target} and {canonical_field}")
+            source_targets[source_field] = canonical_field
+            existing = conn.execute(
+                """
+                SELECT canonical_field FROM canonical_mappings
+                WHERE migration_id = ? AND entity_name = ? AND source_field = ? AND is_confirmed = 1
+                LIMIT 1
+                """,
+                (migration_id, entity_name, source_field),
+            ).fetchone()
+            if existing and existing["canonical_field"] != canonical_field:
+                blockers.append(f"{source_field}: already approved to {existing['canonical_field']}")
+        # Required fields with an unanswered information request are unresolved gaps:
+        # entity-level approval must wait until a response is recorded.
+        for row in rows:
+            if float(row["confidence_score"] or 0.0) < EVIDENCE_REVIEW_THRESHOLD:
+                blockers.append(f"{row['source_field']} -> {row['canonical_field']}: low-confidence proposal ({float(row['confidence_score'] or 0.0):.0%}) needs individual review")
+        # A field supplied by any pending proposal in this set is covered: approving the set closes the request.
+        covered_by_set = {str(r["canonical_field"]) for r in rows if r["canonical_field"]}
+        covered_by_set |= {str(r["canonical_field"]) for r in conn.execute(
+            "SELECT canonical_field FROM canonical_mappings WHERE migration_id = ? AND entity_name = ? AND is_confirmed = 1",
+            (migration_id, entity_name)).fetchall() if r["canonical_field"]}
+        for gap in state_store.questionnaire_data.get("mapping_information_requests", []):
+            if (gap.get("entity") == entity_name and gap.get("status") == "OPEN"
+                    and gap.get("canonical_field") not in covered_by_set
+                    and str(gap.get("migration_id", migration_id)) == migration_id):
+                blockers.append(f"{gap.get('canonical_field')}: required field has an open information request ({gap.get('request_id')})")
+        if blockers:
+            conn.rollback()
+            message = f"Cannot approve all {entity_name} mappings yet. {len(blockers)} validation issue(s): " + "; ".join(blockers)
+            return RedirectResponse(url="/agent-pipeline?error=" + quote_plus(message) + "#pending-mappings", status_code=status.HTTP_303_SEE_OTHER)
+
+        approved_count = 0
+        for row in rows:
+            suggestion_id = row["suggestion_id"]
+            conn.execute(
+                """
+                UPDATE mapping_suggestions
+                SET status = 'APPROVED', reviewer = ?, review_comments = ?, reviewed_utc = ?
+                WHERE suggestion_id = ? AND status = 'PENDING'
+                """,
+                (reviewer_name, comments.strip() or "Entity-level approval: all pending proposals passed validation.", now, suggestion_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO canonical_mappings
+                (mapping_id, migration_id, entity_name, source_field, canonical_field,
+                 mapping_type, transformation_expression, confidence_score, is_confirmed,
+                 created_by, updated_utc)
+                VALUES (?, ?, ?, ?, ?, 'APPROVED_ALIAS', ?, ?, 1, ?, ?)
+                ON CONFLICT(mapping_id) DO UPDATE SET
+                    canonical_field = excluded.canonical_field,
+                    transformation_expression = excluded.transformation_expression,
+                    confidence_score = excluded.confidence_score,
+                    is_confirmed = 1,
+                    created_by = excluded.created_by,
+                    updated_utc = excluded.updated_utc
+                """,
+                (
+                    f"MAP-{row['migration_id']}-{row['entity_name']}-{row['source_field']}",
+                    row["migration_id"], row["entity_name"], row["source_field"],
+                    row["canonical_field"], row["proposed_rule"] or "DIRECT_COPY",
+                    float(row["confidence_score"] or 0.0), reviewer_name, now,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO approvals (id, run_id, artifact_id, stage, decision, reviewer, comments, created_utc)
+                VALUES (?, ?, ?, 'SOURCE_TO_CANONICAL_MAPPING', 'APPROVED', ?, ?, ?)
+                """,
+                (f"APR-{uuid.uuid4().hex}", row["run_id"], suggestion_id, reviewer_name, comments.strip() or "Entity-level mapping approval.", now),
+            )
+            approved_count += 1
+        conn.commit()
+        _sync_mapping_information_requests(migration_id)
+        publish_event("ENTITY_MAPPINGS_APPROVED", migration_id, "entity", entity_name, {"approved_count": approved_count, "comments": comments.strip()}, reviewer_name)
+        state_store.audit_log.append({
+            "event": "ENTITY_LEVEL_MAPPING_APPROVED",
+            "actor": reviewer_name,
+            "timestamp_utc": now,
+            "details": {"migration_id": migration_id, "entity": entity_name, "approved_count": approved_count, "comments": comments.strip()},
+        })
+        message = f"Approved {approved_count} mapping proposal(s) for {entity_name} after validating the entire pending set."
+        return RedirectResponse(url="/agent-pipeline?notice=" + quote_plus(message) + "#pending-mappings", status_code=status.HTTP_303_SEE_OTHER)
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as exc:
+        conn.rollback()
+        logger.exception("Entity-level mapping approval failed for %s", entity_name)
+        raise HTTPException(status_code=500, detail="Could not persist entity-level mapping approval.") from exc
+    finally:
+        conn.close()
+
+
+@app.get("/api/mcl/runs/{mcl_run_id}")
+async def get_mcl_run_lineage(mcl_run_id: str):
+    """Retrieve persisted MCL batch summary, entity runs, and field lineage."""
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM mcl_execution_runs WHERE mcl_run_id = ?",
+            (mcl_run_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"MCL run {mcl_run_id} was not found.")
+        execution = dict(row)
+        entity_summary = json.loads(execution.pop("entity_summary_json"))
+        relationship_summary = json.loads(execution.pop("relationship_summary_json"))
+        execution_boundary = json.loads(execution.pop("execution_boundary_json"))
+        entity_run_ids = [item["run_id"] for item in entity_summary.values() if item.get("run_id")]
+        entity_runs = []
+        field_lineage = []
+        for entity_run_id in entity_run_ids:
+            run_row = conn.execute("SELECT * FROM migration_runs WHERE run_id = ?", (entity_run_id,)).fetchone()
+            if run_row:
+                entity_runs.append(dict(run_row))
+            lineage_rows = conn.execute(
+                "SELECT * FROM field_lineage_audit WHERE run_id = ? ORDER BY timestamp_utc, source_column",
+                (entity_run_id,),
+            ).fetchall()
+            field_lineage.extend(dict(lineage_row) for lineage_row in lineage_rows)
+    finally:
+        conn.close()
+    return JSONResponse({
+        "status": "SUCCESS",
+        "execution": execution,
+        "entities": entity_summary,
+        "relationship_validation": relationship_summary,
+        "execution_boundary": execution_boundary,
+        "entity_runs": entity_runs,
+        "field_lineage": field_lineage,
+    })
+
+
+@app.post("/api/knowledge/file-upload")
+async def upload_firm_file(
+    category: str = Form(...),
+    file: UploadFile = File(...),
+    return_to: str = Form("/firm-knowledge"),
+):
+    filename = file.filename or ""
+    allowed_extensions = {".md", ".txt", ".csv", ".tsv", ".json", ".xlsx", ".xlsm", ".xls"}
+    if Path(filename).suffix.lower() not in allowed_extensions:
+        raise HTTPException(status_code=400, detail="Knowledge assets must be Markdown, text, CSV/TSV, JSON, or Excel files.")
+    content = await file.read()
+    try:
+        doc_record = state_store.add_firm_file(filename, category, content)
+        migration_id = str(state_store.questionnaire_data.get("migration_id", "MIG-UNCONFIGURED"))
+        publish_event("KNOWLEDGE_ASSET_REGISTERED", migration_id, "knowledge_asset", str(doc_record["id"]),
+                      doc_record, "knowledge-curator")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    destination = return_to if return_to in {"/migration-setup", "/firm-knowledge"} else "/firm-knowledge"
+    return RedirectResponse(url=destination, status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/api/pipeline/run")
+async def execute_agent_pipeline(request: Request, rep_code: str = Form("REP-9981")):
+    """Retain a clear compatibility response for the retired legacy cohort pipeline."""
+    get_current_user(request)
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "The legacy cohort pipeline is retired from P0. Use Source Discovery, "
+            "Mapping Studio, and Mapping Review for Account, Household, and Client. "
+            "No cohort execution, target loading, or wave assignment is available."
+        ),
+    )
+
+
+@app.get("/api/pipeline/agent-detail/{agent_id}")
+async def get_agent_detail(agent_id: str, request: Request):
+    user = get_current_user(request)
+    detail = state_store.get_agent_detail(agent_id)
+    return JSONResponse({"status": "SUCCESS", "agent_id": agent_id, "detail": detail})
+
+
+@app.post("/api/pipeline/override-agent")
+async def override_agent_logic(
+    agent_id: str = Form(...),
+    new_logic: str = Form(...),
+    override_notes: str = Form(...)
+):
+    res = state_store.apply_agent_override(agent_id, new_logic, override_notes)
+    logger.info(f"Human intervention override applied to Agent '{agent_id}': {override_notes}")
+    return JSONResponse(res)
+
+
+@app.post("/api/hitl/approve")
+async def approve_cohort(request: Request):
+    """Cohort cutover approval is explicitly deferred from the P0 mapping pilot."""
+    get_current_user(request)
+    raise HTTPException(status_code=409, detail="Cohort/cutover approval is deferred in P0. Review source-to-canonical mappings in Mapping Studio.")
+
+
+@app.post("/api/hitl/reject")
+async def reject_cohort(request: Request):
+    """Cohort rejection is explicitly deferred from the P0 mapping pilot."""
+    get_current_user(request)
+    raise HTTPException(status_code=409, detail="Cohort/cutover review is deferred in P0. Reject mapping proposals in Mapping Studio with a reason.")
+
+
+@app.post("/api/pilot/household/profile")
+async def profile_pilot_household_file(file: UploadFile = File(...)):
+    """Inspects uploaded households.csv, infers types, null rates, and candidate keys."""
+    content = await file.read()
+    profile = SourceDataProfiler.profile_csv_content(file.filename, content, entity_name="Household")
+    if profile.get("status") != "PROFILED":
+        raise HTTPException(status_code=400, detail=profile.get("error_message", "CSV profiling failed."))
+    run_id = f"RUN-{uuid.uuid4().hex}"
+    profile_id = state_store.persist_source_profile(profile, run_id=run_id)
+    profile["run_id"] = run_id
+    profile["profile_id"] = profile_id
+    return JSONResponse({"status": "SUCCESS", "profile": profile})
+
+
+@app.post("/api/pilot/household/map")
+async def map_pilot_household(records: Optional[List[Dict[str, Any]]] = None):
+    """Executes source-to-canonical mapping for Household and persists lineage."""
+    if records is None:
+        records = []
+
+    mapping_res = schema_mapper.map_source_to_canonical("Household", records)
+    run_id = f"RUN-{uuid.uuid4().hex}"
+    state_store.persist_mapping_lineage(mapping_res, run_id=run_id, actor="Platform Admin")
+    safe_mapping = _preview_only_mapping(mapping_res)
+    return JSONResponse({"status": mapping_res.get("status", "UNKNOWN"), "run_id": run_id, "mapping": safe_mapping})
+
+
+@app.get("/api/pilot/household/lineage")
+async def get_pilot_household_lineage():
+    """Retrieves SQLite metadata lineage audit records for Household."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM field_lineage_audit WHERE entity_name = 'Household' ORDER BY timestamp_utc DESC LIMIT 20;")
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return JSONResponse({"status": "SUCCESS", "lineage_records": rows})
+
+
+# --- CLIENT ENDPOINTS ---
+
+@app.post("/api/pilot/client/profile")
+async def profile_pilot_client_file(file: UploadFile = File(...)):
+    """Inspects uploaded clients.csv, infers types, null rates, and candidate keys."""
+    content = await file.read()
+    profile = SourceDataProfiler.profile_csv_content(file.filename, content, entity_name="Client")
+    if profile.get("status") != "PROFILED":
+        raise HTTPException(status_code=400, detail=profile.get("error_message", "CSV profiling failed."))
+    run_id = f"RUN-{uuid.uuid4().hex}"
+    profile_id = state_store.persist_source_profile(profile, run_id=run_id)
+    profile["run_id"] = run_id
+    profile["profile_id"] = profile_id
+    return JSONResponse({"status": "SUCCESS", "profile": profile})
+
+
+@app.post("/api/pilot/client/map")
+async def map_pilot_client(records: Optional[List[Dict[str, Any]]] = None):
+    """Executes source-to-canonical mapping for Client and persists lineage."""
+    if records is None:
+        records = []
+
+    mapping_res = schema_mapper.map_source_to_canonical("Client", records)
+    run_id = f"RUN-{uuid.uuid4().hex}"
+    state_store.persist_mapping_lineage(mapping_res, run_id=run_id, actor="Platform Admin")
+    safe_mapping = _preview_only_mapping(mapping_res)
+    return JSONResponse({"status": mapping_res.get("status", "UNKNOWN"), "run_id": run_id, "mapping": safe_mapping})
+
+
+@app.get("/api/pilot/client/lineage")
+async def get_pilot_client_lineage():
+    """Retrieves SQLite metadata lineage audit records for Client."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM field_lineage_audit WHERE entity_name = 'Client' ORDER BY timestamp_utc DESC LIMIT 20;")
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return JSONResponse({"status": "SUCCESS", "lineage_records": rows})

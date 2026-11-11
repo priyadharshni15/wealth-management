@@ -1,0 +1,171 @@
+import io
+import pytest
+import pandas as pd
+from pathlib import Path
+from control_plane.services.profiler import SourceDataProfiler
+from agents.discovery.schema_mapper_agent import SchemaMapperAgent
+from control_plane.db import init_db, get_db_connection
+from control_plane import file_store
+import ui.state as state_module
+from ui.state import WorkspaceStateStore
+
+SAMPLE_CSV = b"""LEGACY_ACCT_NO,CUST_CODE_SRC,ADVISOR_REP_NUM,REGISTRATION_SRC_TYPE,ACCOUNT_OPEN_DT
+ACC-99812,SCHW,9981,INDV_TAXABLE,03/15/2021
+ACC-99813,SCHW,9981,IRA_ROLL,06/20/2022
+ACC-10010,SCHW,1001,JT_TEN,11/01/2019"""
+
+
+def test_profiler_inspects_source_file():
+    profile = SourceDataProfiler.profile_csv_content("accounts.csv", SAMPLE_CSV, "Account")
+    assert profile["status"] == "PROFILED"
+    assert profile["row_count"] == 3
+    assert profile["column_count"] == 5
+    assert "LEGACY_ACCT_NO" in profile["candidate_keys"]
+
+
+def test_schema_mapper_account_pilot():
+    df = pd.read_csv(io.BytesIO(SAMPLE_CSV))
+    raw_records = df.to_dict(orient="records")
+    agent = SchemaMapperAgent()
+    res = agent.map_source_to_canonical("Account", raw_records)
+
+    assert res["status"] == "SUCCESS"
+    assert res["confidence_score"] == 1.0
+    assert len(res["missing_required"]) == 0
+    assert len(res["unmapped_fields"]) == 0
+
+    record0 = res["mapped_records"][0]
+    assert record0["ACCT_NUM"] == "ACC-99812"
+    assert record0["CUSTODIAN_CODE"] == "SCHWAB"
+    assert record0["REP_CODE"] == "REP-9981"
+    assert record0["REG_TYPE"] == "INDIVIDUAL"
+    assert record0["OPEN_DATE"] == "2021-03-15"
+
+
+def test_missing_mandatory_fields_penalty():
+    incomplete_csv = b"""LEGACY_ACCT_NO,CUST_CODE_SRC,UNKNOWN_EXTRA_FIELD
+ACC-101,SCHW,SOMETHING"""
+    df = pd.read_csv(io.BytesIO(incomplete_csv))
+    agent = SchemaMapperAgent()
+    res = agent.map_source_to_canonical("Account", df.to_dict(orient="records"))
+
+    assert res["status"] == "WARNING_INCOMPLETE"
+    assert "UNKNOWN_EXTRA_FIELD" in res["unmapped_fields"]
+    assert "REP_CODE" not in res["missing_required"]  # optional since contract 1.1.0
+    assert "REG_TYPE" in res["missing_required"]
+    assert "OPEN_DATE" in res["missing_required"]
+    assert res["confidence_score"] < 0.70
+    assert any("Missing required canonical fields" in w for w in res["warnings"])
+
+
+def test_uploaded_source_file_is_persisted_and_reusable(tmp_path, monkeypatch):
+    monkeypatch.setattr(state_module, "SOURCE_UPLOAD_ROOT", tmp_path / "uploads")
+    store = WorkspaceStateStore()
+    record = store.attach_entity_sample_file("Account", "accounts.csv", SAMPLE_CSV)
+
+    stored_path = record["stored_path"]
+    assert record["status"] == "UPLOADED"
+    assert record["row_count"] == 3
+    assert record["column_count"] == 5
+    assert file_store.read_bytes(stored_path) == SAMPLE_CSV
+    assert store.entity_sample_files["Account"]["stored_path"] == stored_path
+
+
+def test_account_source_roles_keep_separate_files_and_lineage(tmp_path, monkeypatch):
+    monkeypatch.setattr(state_module, "SOURCE_UPLOAD_ROOT", tmp_path / "uploads")
+    store = WorkspaceStateStore()
+    master = store.attach_entity_sample_file("Account", "accounts.csv", SAMPLE_CSV, source_role="ACCOUNT_MASTER")
+    name_address_csv = b"ACCOUNT_ID,ADDRESS_LINE1,CITY\n00012,10 Main St,Chennai\n"
+    name_address = store.attach_entity_sample_file("Account", "name_address.csv", name_address_csv, source_role="NAME_ADDRESS")
+    account_type_csv = b"ACCOUNT_TYPE_CODE,ACCOUNT_TYPE_DESC\nIRA,Retirement\n"
+    account_type = store.attach_entity_sample_file("Account", "account_type.csv", account_type_csv, source_role="ACCOUNT_TYPE")
+
+    assert master["source_role"] == "ACCOUNT_MASTER"
+    assert name_address["source_role"] == "NAME_ADDRESS"
+    assert account_type["source_role"] == "ACCOUNT_TYPE"
+    assert account_type["entity_name"] == "Account"
+    assert account_type["migration_id"]
+    assert account_type["filename"] == "account_type.csv"
+    assert file_store.read_bytes(account_type["stored_path"]) == account_type_csv
+    assert store.entity_sample_files["Account"]["stored_path"] == master["stored_path"]
+    assert store.entity_source_files["Account"]["NAME_ADDRESS"]["stored_path"] == name_address["stored_path"]
+    assert store.entity_source_files["Account"]["ACCOUNT_TYPE"]["stored_path"] == account_type["stored_path"]
+
+
+def test_uploaded_source_rejects_invalid_csv(tmp_path, monkeypatch):
+    monkeypatch.setattr(state_module, "SOURCE_UPLOAD_ROOT", tmp_path / "uploads")
+    store = WorkspaceStateStore()
+
+    with pytest.raises(ValueError, match="Uploaded file is empty"):
+        store.attach_entity_sample_file("Account", "accounts.csv", b"")
+
+
+def test_uploaded_source_rejects_malformed_excel(tmp_path, monkeypatch):
+    monkeypatch.setattr(state_module, "SOURCE_UPLOAD_ROOT", tmp_path / "uploads")
+    store = WorkspaceStateStore()
+
+    with pytest.raises(ValueError, match="Could not parse"):
+        store.attach_entity_sample_file("Account", "accounts.xlsx", SAMPLE_CSV)
+
+
+def test_uploaded_source_accepts_excel(tmp_path, monkeypatch):
+    monkeypatch.setattr(state_module, "SOURCE_UPLOAD_ROOT", tmp_path / "uploads")
+    store = WorkspaceStateStore()
+    buffer = io.BytesIO()
+    pd.DataFrame({"LEGACY_ACCT_NO": ["00012"], "CUST_CODE_SRC": ["SCHW"]}).to_excel(
+        buffer, index=False, engine="openpyxl"
+    )
+
+    record = store.attach_entity_sample_file("Account", "accounts.xlsx", buffer.getvalue())
+
+    assert record["status"] == "UPLOADED"
+    assert record["row_count"] == 1
+    assert record["columns"] == ["LEGACY_ACCT_NO", "CUST_CODE_SRC"]
+
+
+def test_profile_persistence_failure_is_not_suppressed(monkeypatch):
+    store = WorkspaceStateStore()
+
+    class BrokenConnection:
+        def execute(self, *args, **kwargs):
+            raise RuntimeError("database unavailable")
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(state_module, "get_db_connection", lambda: BrokenConnection())
+    profile = SourceDataProfiler.profile_csv_content("accounts.csv", SAMPLE_CSV, "Account")
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        store.persist_source_profile(profile, run_id="TEST-PERSISTENCE-FAILURE")
+
+
+
+@pytest.mark.parametrize(
+    ("entity", "role", "filename", "csv_bytes"),
+    [
+        ("Household", "ENTITY_MASTER", "households.csv", b"HH_ID,HH_NAME\nH001,Family One\n"),
+        ("Household", "HOUSEHOLD_MAPPING", "household_mapping.csv", b"HH_ID,ACCOUNT_ID\nH001,A001\n"),
+        ("Client", "ENTITY_MASTER", "clients.csv", b"CLIENT_ID,LEGAL_NAME\nC001,Example Client\n"),
+        ("Client", "CLIENT_MODEL", "client_model.csv", b"CLIENT_ID,MODEL_CODE\nC001,MOD001\n"),
+    ],
+)
+def test_household_and_client_source_roles_are_retained_separately(
+    tmp_path, monkeypatch, entity, role, filename, csv_bytes
+):
+    monkeypatch.setattr(state_module, "SOURCE_UPLOAD_ROOT", tmp_path / "uploads")
+    store = WorkspaceStateStore()
+    record = store.attach_entity_sample_file(entity, filename, csv_bytes, source_role=role)
+
+    assert record["entity_name"] == entity
+    assert record["source_role"] == role
+    assert record["status"] == "UPLOADED"
+    assert record["row_count"] == 1
+    assert record["columns"]
+    assert store.entity_source_files[entity][role]["stored_path"] == record["stored_path"]
+    if role == "ENTITY_MASTER":
+        assert store.entity_sample_files[entity]["stored_path"] == record["stored_path"]
+    else:
+        assert entity not in store.entity_sample_files

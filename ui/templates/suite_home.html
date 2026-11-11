@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light" data-trole="{{ trole|default('IL') }}">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>Xodus suite · Choose a space</title>
+    <script>try{var t=localStorage.getItem("xodus.theme");if(t==="dark"||t==="light")document.documentElement.setAttribute("data-theme",t)}catch(e){}</script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/suite.css">
+    <link rel="stylesheet" href="/static/dm.css">
+    <link rel="stylesheet" href="/static/xodus.css">
+    <link rel="stylesheet" href="/static/assistant.css">
+</head>
+<body>
+{% set suite_cur = "" %}{% include "_suite_top.html" %}
+<header class="hero"><div class="wrap hero-in">
+  <div class="eyebrow"><i></i> WealthTech AI Labs · for RIA acquirers</div>
+  <h1>From the first deal conversation to the <em>last reconciled account</em>.</h1>
+  <p>Xodus guides an RIA acquisition through research, decision, data migration and cutover. Choose where to work. Governance keeps every gate intact.</p>
+</div></header>
+<main class="wrap page">
+  <div class="spaces">
+    <article class="sc deal">
+      <div class="k">Research, documents and a clear recommendation</div><h2>Deal Room</h2>
+      <p>Study the target, build the documents and get a prescriptive recommendation with the nuances spelled out. It ends with the go / no-go decision.</p>
+      <ul><li>Target research with sources</li><li>Deal documents and estimate</li><li>Recommendation with alternatives</li></ul>
+      <div class="st">Go decision signed. Migration workspace created.</div>
+      <div class="ft"><a class="btn deal" href="/deal-room">Enter Deal Room</a><span class="chip g">Open to you</span></div>
+    </article>
+    <article class="sc dm">
+      <div class="k">The real data migration work</div><h2>Data Migration</h2>
+      <p>Six agents move the book through Landing, Staged and Transformed, with a person at every gate. Set up the platform and each migration workspace here.</p>
+      <ul><li>Migration workspaces, such as CoreCap</li><li>Pipeline by zone with gates</li><li>Platform and migration setup</li></ul>
+      <div class="st">{{ progress.next.label }}{% if progress.status_chip %} · {{ progress.status_chip.label }}{% endif %}</div>
+      <div class="ft"><a class="btn dm" href="/continue-data-migration">Enter Data Migration</a><span class="chip g">Open to you</span></div>
+    </article>
+    <article class="sc gov">
+      <div class="k">The overall view, with every gate intact</div><h2>Governance</h2>
+      <p>See every gate from the first approval to hypercare close-out. Check that no gate was skipped and that evidence is attached.</p>
+      <ul><li>Gate chain across all spaces</li><li>Integrity checks and audit trail</li><li>Cutover and close-out gates</li></ul>
+      <div class="st">6 of 12 gates approved · 1 waiting · 6 of 6 checks pass</div>
+      <div class="ft"><a class="btn gov" href="/governance">Enter Governance</a><a class="btn g" href="/canonical-changes">Canonical changes</a><span class="chip g">Open to you</span></div>
+    </article>
+  </div>
+  <div class="card" style="margin-top:16px">
+    <h3>One deal, three lenses</h3>
+    <p class="d">The Deal Room ends in a decision. That decision opens the Data Migration workspace. Governance watches every gate from the first to the last.</p>
+    <div class="jr">
+      <div class="jn deal"><small>Deal Room</small><strong>Research and document</strong><span>Target profile, diligence, estimate</span></div>
+      <div class="jn deal"><small>Deal Room</small><strong>Recommend and decide</strong><span>Prescriptive recommendation, go / no-go</span></div>
+      <div class="jn dm"><small>Data Migration</small><strong>Migrate the book</strong><span>Land, profile, map, load, reconcile</span></div>
+      <div class="jn gov"><small>Governance</small><strong>Cut over and close</strong><span>Readiness, go-live, hypercare</span></div>
+    </div>
+    <div class="gbar"><span>Governance view: 6 of 12 gates approved, 1 waiting (template sample state)</span><a class="btn g sm" href="/governance">Open Governance</a></div>
+  </div>
+  <div class="card ma" style="margin-top:16px">
+    <h3>Meeting assistant, in every space</h3>
+    <p class="d">Ask for notes from any meeting, let the assistant join your calls, and get insights from what was said. Answers stay inside the spaces your role can see.</p>
+    <div class="mab"><button class="btn g" onclick="openAssistant('ask')" type="button">Ask about a meeting</button><button class="btn g" onclick="openAssistant('notes')" type="button">Read notes</button><button class="btn g" onclick="openAssistant('insights')" type="button">See insights</button><button class="btn g" onclick="openAssistant('connect')" type="button">Join meetings</button></div>
+  </div>
+</main>
+<script>
+(function(){var b=document.getElementById("themeBtn");if(b)b.addEventListener("click",function(){var n=document.documentElement.getAttribute("data-theme")==="dark"?"light":"dark";document.documentElement.setAttribute("data-theme",n);try{localStorage.setItem("xodus.theme",n)}catch(e){}})})();
+</script>
+<script src="/static/assistant.js"></script>
+</body>
+</html>

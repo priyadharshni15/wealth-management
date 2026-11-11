@@ -1,0 +1,17 @@
+{
+  "phase": "P0",
+  "purpose": "Source-to-canonical mapping discovery",
+  "canonical_entities": ["Account", "Client", "Household"],
+  "responses": {
+    "firm_name": "Core Cap Wealth Management",
+    "source_systems": ["Amplify", "Black Diamond"],
+    "business_data_owner": "",
+    "mapping_approver": "",
+    "identifier_relationship_notes": ""
+  },
+  "governance": {
+    "mapping_approval_required": true,
+    "relationship_keys_must_be_documented": true,
+    "wave_assignment_enabled": false
+  }
+}

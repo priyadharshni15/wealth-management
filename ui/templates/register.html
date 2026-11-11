@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>Request an account · XODUS Data Migration</title>
+    <script>try{var t=localStorage.getItem("xodus.theme");if(t==="dark"||t==="light")document.documentElement.setAttribute("data-theme",t)}catch(e){}</script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/suite.css">
+    <link rel="stylesheet" href="/static/dm.css">
+    <link rel="stylesheet" href="/static/xodus.css">
+</head>
+<body>
+<div class="login">
+  <aside class="l-aside">
+    <div class="lock" style="color:#fff"><span class="mk">XA</span><span><strong>XODUS · Data Migration</strong><span>WealthAI Labs</span></span></div>
+    <div>
+      <span class="l-tag"><i></i> CoreCap → Simplicity pilot</span>
+      <h1>Move the advisory book <b>without losing the detail</b>.</h1>
+      <p>A governed migration workbench with an agent at every stage and a human review gate before anything is approved. Reviews and approvals stay with people.</p>
+      <div class="l-flow">
+        <div class="l-row"><b>◉</b><span><strong>Load and inspect</strong><span>Source files profiled and classified</span></span><span class="pbchip">01</span></div>
+        <div class="l-row"><b>⇄</b><span><strong>Map to the canonical model</strong><span>Account, Client and Household</span></span><span class="pbchip">02</span></div>
+        <div class="l-row"><b>✓</b><span><strong>Validate and record</strong><span>Lineage, reconciliation and audit</span></span><span class="pbchip">03</span></div>
+      </div>
+    </div>
+    <div class="l-foot"><span>Protected platform</span><span>Session-based control plane auth</span></div>
+  </aside>
+  <main class="l-main">
+    <div class="l-card">
+      <div class="ey">Request access</div>
+      <h2>Request an account</h2>
+      <p class="lead">Your request stays pending until a Platform Admin approves it and assigns your roles.</p>
+      {% if notice %}<div class="idn" data-testid="register-notice" role="status">{{ notice }}</div>{% endif %}
+      {% if error %}<div class="exc" style="background:var(--bad-bg);color:var(--bad);border-left-color:var(--bad)" role="alert" data-testid="register-error">{{ error }}</div>{% endif %}
+      <form action="/register" method="POST" style="display:grid;gap:12px">
+            <div style="display:grid;gap:5px"><label for="reg-name" style="font-size:11px;font-weight:800;letter-spacing:.6px;text-transform:uppercase;color:var(--muted)">Full name</label><input id="reg-name" name="name" required minlength="2" maxlength="80" autocomplete="name" class="fld"></div>
+            <div style="display:grid;gap:5px"><label for="reg-email" style="font-size:11px;font-weight:800;letter-spacing:.6px;text-transform:uppercase;color:var(--muted)">Email address</label><input type="email" id="reg-email" name="email" required autocomplete="username" class="fld"></div>
+            <div style="display:grid;gap:5px"><label for="reg-password" style="font-size:11px;font-weight:800;letter-spacing:.6px;text-transform:uppercase;color:var(--muted)">Password (10+ characters)</label><input type="password" id="reg-password" name="password" required minlength="10" autocomplete="new-password" class="fld"></div>
+            <div style="display:grid;gap:5px"><label for="reg-confirm" style="font-size:11px;font-weight:800;letter-spacing:.6px;text-transform:uppercase;color:var(--muted)">Confirm password</label><input type="password" id="reg-confirm" name="confirm" required minlength="10" autocomplete="new-password" class="fld"></div>
+            <div style="position:absolute;left:-9999px" aria-hidden="true"><label>Website<input name="website" tabindex="-1" autocomplete="off"></label></div>
+            <p class="hint" style="margin:4px 0 0;background:var(--tint-b);color:var(--ink-b)">Your request stays pending until a Platform Admin approves it and assigns your roles. Passwords are stored only as salted hashes.</p>
+            <button type="submit" class="btn p" style="justify-content:center;padding:12px">Request account</button>
+            <p style="text-align:center;font-size:12px;color:var(--muted);margin:0">Already approved? <a href="/login" style="font-weight:700;color:var(--ink-b)">Sign in</a></p>
+        </form>
+    </div>
+  </main>
+</div>
+</body>
+</html>
