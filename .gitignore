@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Local runtime data (SQLite files, uploads, stored artifacts)
+App_Data/
+simulated_target_service/data/
+
+# Secrets and per-machine config (never commit)
+.env
+.env.*
+!.env.example
+demo_data/demo_passwords*
+demo_data/*.local.json
+demo_data/*.local.json.bak
